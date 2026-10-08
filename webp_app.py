@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.3"
+VERSION = "1.4"
 REPO_RAW = os.environ.get("WEBP_REPO", "https://raw.githubusercontent.com/mkkatrin/webp-converter/main/")
 APP_FILE = Path(__file__).resolve()
 
@@ -709,172 +709,342 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Конвертер</title>
 <style>
-:root{--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--muted:#6e6e73;--line:#e3e3e8;--accent:#0a7cff;--ok:#1f9d55;--err:#d93025;--drop:#eef5ff}
-@media (prefers-color-scheme:dark){:root{--bg:#161618;--card:#222225;--text:#f2f2f4;--muted:#9a9aa0;--line:#333338;--accent:#4c9dff;--ok:#3ccf7a;--err:#ff6b5e;--drop:#1c2633}}
+:root{
+  --bg:#f2f2f4;--panel:#ffffff;--sunk:#f6f6f8;--line:#e2e2e6;--text:#18181b;--muted:#6b6b73;--faint:#9a9aa2;
+  --img:#2f6fed;--img-soft:#e8f0fe;--vid:#7c4dff;--vid-soft:#f0ebff;--pdf:#e5484d;--pdf-soft:#fdecec;
+  --ok:#16a34a;--warn:#c2410c;--err:#dc2626;--btn:#18181b;--btn-text:#fff;
+  --r-lg:16px;--r-md:10px;--r-sm:7px;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#141416;--panel:#1d1d20;--sunk:#252528;--line:#2f2f33;--text:#f2f2f3;--muted:#a1a1a8;--faint:#6f6f76;
+  --img:#5b8ff9;--img-soft:#1c2740;--vid:#a07cff;--vid-soft:#2a2240;--pdf:#ff6b6f;--pdf-soft:#3a1f22;
+  --ok:#4ade80;--warn:#fb923c;--err:#f87171;--btn:#f2f2f3;--btn-text:#141416;
+}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif}
-.wrap{max-width:780px;margin:0 auto;padding:32px 16px 48px}
-h1{font-size:26px;margin:0 0 4px;letter-spacing:-.02em}
-.sub{color:var(--muted);margin:0 0 22px}
-.drop{border:2px dashed var(--line);border-radius:18px;background:var(--card);padding:44px 20px;text-align:center;cursor:pointer;transition:.15s}
-.drop.over{border-color:var(--accent);background:var(--drop)}
-.drop .big{font-size:18px;font-weight:600}
-.drop .small{color:var(--muted);margin-top:6px}
-.drop svg{width:44px;height:44px;color:var(--accent);margin-bottom:10px}
-.panel{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;margin-top:16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px 20px;align-items:end}
-label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
-input[type=range]{width:100%;accent-color:var(--accent)}
-input[type=number],select{width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--text);font:inherit}
-.chk{display:flex;gap:8px;align-items:center;color:var(--text);font-size:15px;margin:0;padding-bottom:8px}
-.chk input{width:18px;height:18px;accent-color:var(--accent)}
-.warn{display:none;margin-top:14px;padding:10px 14px;border-radius:12px;background:rgba(217,48,37,.1);color:var(--err);font-size:14px}
-.list{margin-top:18px;display:flex;flex-direction:column;gap:8px}
-.item{display:flex;gap:14px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 12px}
-.thumb{width:56px;height:56px;border-radius:10px;background:var(--bg);flex:none;object-fit:cover}
-.info{flex:1;min-width:0}
-.name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.meta{font-size:13px;color:var(--muted)}
-.meta .good{color:var(--ok);font-weight:600}
-.meta .bad{color:var(--err)}
-.dl{flex:none;color:var(--accent);text-decoration:none;font-weight:600;font-size:14px;padding:6px 10px;border-radius:8px}
-.dl:hover{background:var(--drop)}
-.spin{width:18px;height:18px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:s .8s linear infinite;flex:none}
+html,body{margin:0}
+body{background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+button,input{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--img);outline-offset:2px}
+.wrap{max-width:820px;margin:0 auto;padding:28px 16px 140px}
+
+/* шапка */
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px}
+.brand{display:flex;align-items:center;gap:10px}
+.logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(#4aa8ff,#1463ff);display:grid;place-items:center}
+.logo svg{width:18px;height:18px}
+h1{font-size:19px;font-weight:650;letter-spacing:-.01em;margin:0}
+.link{background:none;border:0;color:var(--muted);cursor:pointer;padding:6px 8px;border-radius:var(--r-sm);font-size:14px}
+.link:hover{color:var(--text);background:var(--sunk)}
+
+/* плашки сверху */
+.notice{display:none;margin:0 0 16px;padding:14px 16px;border-radius:var(--r-md);background:var(--panel);border:1px solid var(--line)}
+.notice h3{margin:0 0 4px;font-size:15px}
+.notice p,.notice ul{margin:0 0 10px;color:var(--muted);font-size:14px}
+.notice ul{padding-left:18px}
+.notice .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.notice.update{border-color:var(--img)}
+
+/* область загрузки */
+.drop{position:relative;border:1.5px dashed var(--line);border-radius:var(--r-lg);background:var(--panel);cursor:pointer;transition:border-color .15s,background .15s;text-align:center}
+.drop.empty{padding:88px 24px}
+.drop.slim{padding:14px 18px;display:flex;align-items:center;justify-content:center;gap:10px;color:var(--muted)}
+.drop.over{border-color:var(--img);background:var(--img-soft)}
+.drop .big{font-size:22px;font-weight:650;letter-spacing:-.015em;margin:14px 0 6px}
+.drop .small{color:var(--muted);max-width:420px;margin:0 auto}
+.kinds{display:flex;justify-content:center;gap:8px;margin-top:22px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:13px;padding:5px 10px;border-radius:99px;background:var(--sunk);color:var(--muted)}
+.dot{width:8px;height:8px;border-radius:50%}
+.dot.img{background:var(--img)}.dot.vid{background:var(--vid)}.dot.pdf{background:var(--pdf)}
+.drop .arrow{width:46px;height:46px;color:var(--faint)}
+.drop.slim .arrow{width:18px;height:18px}
+
+/* группы */
+.group{margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);overflow:hidden}
+.ghead{display:flex;align-items:center;gap:10px;padding:14px 18px 0}
+.ghead h2{margin:0;font-size:16px;font-weight:650}
+.ghead .count{color:var(--muted);font-size:14px}
+.ghead .bar{width:4px;height:18px;border-radius:2px}
+.group.img .bar{background:var(--img)}.group.vid .bar{background:var(--vid)}.group.pdf .bar{background:var(--pdf)}
+.settings{display:flex;flex-wrap:wrap;gap:14px 26px;padding:14px 18px 16px;border-bottom:1px solid var(--line)}
+.setting label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:6px}
+.seg{display:inline-flex;background:var(--sunk);border-radius:var(--r-sm);padding:2px;gap:2px;flex-wrap:wrap}
+.seg button{border:0;background:none;padding:5px 11px;border-radius:5px;cursor:pointer;font-size:13.5px;color:var(--muted);white-space:nowrap}
+.seg button:hover{color:var(--text)}
+.seg button.on{background:var(--panel);color:var(--text);box-shadow:0 0 0 1px var(--line)}
+.group.img .seg button.on{color:var(--img)}.group.vid .seg button.on{color:var(--vid)}.group.pdf .seg button.on{color:var(--pdf)}
+.custom{width:68px;padding:5px 8px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--sunk);font-size:13.5px;margin-left:6px}
+.hint{flex-basis:100%;font-size:13px;color:var(--muted);margin:-4px 0 0}
+.hint.warn{color:var(--warn)}
+.hint:empty{display:none}
+
+/* файлы */
+.files{list-style:none;margin:0;padding:6px 0}
+.file{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:4px 14px;align-items:center;padding:8px 18px}
+.file + .file{border-top:1px solid var(--line)}
+.thumb{width:44px;height:44px;border-radius:8px;background:var(--sunk);object-fit:cover;display:grid;place-items:center;font-size:11px;font-weight:700;overflow:hidden}
+.group.pdf .thumb{background:var(--pdf-soft);color:var(--pdf)}
+.group.vid .thumb{background:var(--vid-soft);color:var(--vid)}
+.fname{font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fmeta{font-size:13px;color:var(--muted);display:flex;gap:12px;flex-wrap:wrap}
+.fmeta .good{color:var(--ok);font-weight:600}
+.fmeta .bad{color:var(--err)}
+.fmeta .warn{color:var(--warn)}
+.side{display:flex;align-items:center;gap:6px}
+.x{border:0;background:none;color:var(--faint);cursor:pointer;width:28px;height:28px;border-radius:6px;font-size:18px;line-height:1}
+.x:hover{background:var(--sunk);color:var(--text)}
+.open{color:var(--img);text-decoration:none;font-weight:600;font-size:14px;padding:5px 8px;border-radius:6px}
+.open:hover{background:var(--img-soft)}
+.spin{width:18px;height:18px;border:2px solid var(--line);border-top-color:var(--muted);border-radius:50%;animation:s .8s linear infinite}
 @keyframes s{to{transform:rotate(360deg)}}
-.foot{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-top:20px}
-.btn{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:10px 16px;font:inherit;font-weight:600;cursor:pointer}
-.btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
-.path{color:var(--muted);font-size:13px}
-.upd{display:none;margin:0 0 18px;padding:14px 16px;border-radius:14px;background:var(--drop);border:1px solid var(--accent)}
-.upd b{font-size:16px}
-.upd ul{margin:6px 0 10px;padding-left:20px;color:var(--text)}
-.upd .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.upd .msg{font-size:14px;color:var(--muted)}
-.ver{color:var(--muted);font-size:12px;margin-top:14px;text-align:center}
-.item{flex-wrap:wrap}
-.pdft{width:56px;height:56px;border-radius:10px;background:#e5484d;color:#fff;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:center;flex:none}
-.choice{flex-basis:100%;margin-top:4px;padding:12px 14px;border-radius:12px;background:var(--bg);font-size:14px}
+.done-ic{width:20px;height:20px;color:var(--ok)}
+
+/* выбор для PDF */
+.choice{grid-column:2 / -1;margin:6px 0 4px;padding:12px 14px;border-radius:var(--r-md);background:var(--pdf-soft);font-size:14px}
 .choice p{margin:0 0 10px}
 .choice .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.choice .btn{padding:8px 12px;font-size:14px;text-decoration:none;display:inline-block}
-.choice .hint{color:var(--muted);font-size:13px;margin-top:8px}
-.files{flex-basis:100%;display:flex;flex-direction:column;gap:4px;margin-top:4px}
-.files .f{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:6px 10px;border-radius:8px;background:var(--bg)}
-.files .f a{color:var(--accent);font-weight:600;text-decoration:none;white-space:nowrap}
-.files .f span{min-width:0;overflow:hidden;text-overflow:ellipsis}
-.ver a{color:var(--muted);margin-left:10px}
-.note{display:none;margin:0 0 18px;padding:14px 16px;border-radius:14px;background:rgba(31,157,85,.1);border:1px solid var(--ok);font-size:14px}
-.note b{display:block;font-size:15px;margin-bottom:4px}
-.bye{display:none;text-align:center;padding:80px 16px;color:var(--muted)}
-.bye b{display:block;color:var(--text);font-size:20px;margin-bottom:6px}
-</style></head><body><div class="wrap">
-<h1>Конвертер</h1>
-<p class="sub">Картинки и видео → WebP, PDF → сжатие до нужного размера. Всё обрабатывается на этом компьютере.</p>
+.choice small{display:block;color:var(--muted);margin-top:8px;font-size:13px}
+.parts{grid-column:2 / -1;display:flex;flex-direction:column;gap:2px;margin:4px 0}
+.part{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13.5px}
+.part span{color:var(--muted)}
 
-<div class="note" id="note"><b>Теперь без Терминала</b>Конвертер запускается значком «Конвертер» на Рабочем столе или в Launchpad. Окно Терминала можно закрыть — при следующем запуске оно больше не появится.</div>
+/* кнопки */
+.btn{border:0;border-radius:var(--r-sm);padding:9px 16px;font-weight:600;cursor:pointer;background:var(--btn);color:var(--btn-text);text-decoration:none;display:inline-block;font-size:14px}
+.btn.ghost{background:var(--panel);color:var(--text);box-shadow:inset 0 0 0 1px var(--line)}
+.btn:disabled{opacity:.45;cursor:default}
 
-<div class="upd" id="upd">
-  <b id="updTitle">Доступно обновление</b>
-  <div class="msg">Что нового:</div>
-  <ul id="updNotes"></ul>
-  <div class="row"><button class="btn" id="updGo">Обновить</button><button class="btn ghost" id="updLater">Позже</button><span class="msg" id="updMsg"></span></div>
+/* нижняя панель */
+.dock{position:fixed;left:0;right:0;bottom:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-top:1px solid var(--line);display:none}
+.dock .in{max-width:820px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.dock .sum{color:var(--muted);font-size:14px}
+.dock .sum b{color:var(--text);font-weight:600}
+.dock .acts{display:flex;gap:8px}
+.dock .btn.go{padding:11px 22px;font-size:15px}
+
+.warnline{display:none;margin-top:12px;padding:10px 14px;border-radius:var(--r-md);background:var(--pdf-soft);color:var(--err);font-size:14px}
+.unsup{margin-top:12px;font-size:13.5px;color:var(--muted)}
+.foot{margin-top:28px;display:flex;justify-content:center;gap:4px;color:var(--faint);font-size:12.5px}
+.bye{display:none;text-align:center;padding:120px 16px;color:var(--muted)}
+.bye h2{color:var(--text);margin:0 0 6px;font-size:20px}
+@media (max-width:560px){.drop.empty{padding:56px 18px}.settings{gap:12px}.file{padding:8px 14px}}
+@media (prefers-reduced-motion:reduce){.spin{animation-duration:2s}}
+</style></head><body>
+<div class="wrap" id="app">
+  <div class="top">
+    <div class="brand">
+      <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="14" rx="2.5"/><circle cx="8.5" cy="9.5" r="1.6" fill="#fff" stroke="none"/><path d="M5 17l4.5-4.5 3 3 2.5-2.5L19 17"/></svg></div>
+      <h1>Конвертер</h1>
+    </div>
+    <button class="link" id="open">Открыть папку с результатами</button>
+  </div>
+
+  <div class="notice" id="note"><h3>Теперь без Терминала</h3><p>Конвертер запускается значком «Конвертер» на Рабочем столе или в Launchpad. Окно Терминала можно закрыть.</p></div>
+
+  <div class="notice update" id="upd">
+    <h3 id="updTitle">Доступно обновление</h3>
+    <ul id="updNotes"></ul>
+    <div class="row"><button class="btn" id="updGo">Обновить</button><button class="btn ghost" id="updLater">Позже</button><span id="updMsg" style="color:var(--muted);font-size:14px"></span></div>
+  </div>
+
+  <div class="drop empty" id="drop" tabindex="0" role="button" aria-label="Выбрать файлы">
+    <svg class="arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V4M7.5 8.5 12 4l4.5 4.5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+    <div class="big" id="dropBig">Перетащите файлы сюда</div>
+    <div class="small" id="dropSmall">или нажмите, чтобы выбрать. Конвертер сам поймёт, что это, и предложит подходящие настройки.</div>
+    <div class="kinds" id="kinds">
+      <span class="chip"><span class="dot img"></span>Картинки в WebP</span>
+      <span class="chip"><span class="dot vid"></span>Видео и GIF в WebP</span>
+      <span class="chip"><span class="dot pdf"></span>Сжатие PDF</span>
+    </div>
+    <input type="file" id="pick" multiple accept="image/*,video/*,.heic,.heif,.pdf,application/pdf" hidden>
+  </div>
+  <div class="warnline" id="warn">Видео и GIF не сконвертируются: не установлен ffmpeg. Картинки и PDF работают.</div>
+  <div class="unsup" id="unsup"></div>
+
+  <div id="groups"></div>
+
+  <div class="foot"><span id="ver"></span><button class="link" id="quit" style="font-size:12.5px;padding:0 6px">Закрыть конвертер</button></div>
 </div>
 
-<div class="drop" id="drop">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
-  <div class="big">Перетащите сюда файлы</div>
-  <div class="small">или нажмите, чтобы выбрать · JPG, PNG, HEIC, GIF, MP4, MOV, PDF…</div>
-  <input type="file" id="pick" multiple accept="image/*,video/*,.heic,.heif,.pdf,application/pdf" hidden>
-</div>
-<div class="warn" id="warn">ffmpeg не найден — картинки конвертируются, а видео и GIF нет. Установите: <b>brew install ffmpeg</b> и перезапустите приложение.</div>
+<div class="bye" id="bye"><h2>Конвертер закрыт</h2>Чтобы снова открыть его, запустите значок «Конвертер».</div>
 
-<div class="panel">
-  <div><label>Качество: <b id="qv">80</b></label><input type="range" id="q" min="10" max="100" value="80"></div>
-  <div><label>Макс. ширина, px</label><input type="number" id="w" placeholder="как в оригинале" min="16" step="10"></div>
-  <div><label>Кадров/с для видео</label><select id="fps"><option>8</option><option>10</option><option>12</option><option selected>15</option><option>20</option><option>24</option><option>30</option></select></div>
-  <div><label>PDF: сжать до, МБ</label><input type="number" id="pdfmb" value="20" min="1" step="1"></div>
-  <div><label class="chk"><input type="checkbox" id="lossless"> Без потерь</label></div>
-</div>
+<div class="dock" id="dock"><div class="in">
+  <div class="sum" id="sum"></div>
+  <div class="acts"><button class="btn ghost" id="reset">Очистить</button><button class="btn go" id="go">Конвертировать</button></div>
+</div></div>
 
-<div class="list" id="list"></div>
-
-<div class="foot">
-  <span class="path" id="path"></span>
-  <span><button class="btn ghost" id="clear">Очистить список</button> <button class="btn" id="open">Открыть папку</button></span>
-</div>
-<div class="ver"><span id="ver"></span><a href="#" id="quit">Закрыть конвертер</a></div>
-</div>
-<div class="bye" id="bye"><b>Конвертер закрыт</b>Чтобы снова открыть его, запустите значок «Конвертер».
-</div>
 <script>
 const $=id=>document.getElementById(id);
-const drop=$('drop'),pick=$('pick'),list=$('list');
-const queue=[];let busy=false;
-function size(n){if(n<1024)return n+' Б';if(n<1048576)return (n/1024).toFixed(0)+' КБ';return (n/1048576).toFixed(1)+' МБ'}
-function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-fetch('/status').then(r=>r.json()).then(s=>{$('path').textContent='Сохраняется в: '+s.out.replace(/^\/Users\/[^/]+/,'~');if(!s.ffmpeg)$('warn').style.display='block';$('ver').textContent='Версия '+s.version;if(s.migrated)$('note').style.display='block'});
+const IMG=/\.(jpe?g|png|bmp|tiff?|heic|heif|avif|ico|webp)$/i, VID=/\.(mp4|mov|avi|mkv|webm|m4v|wmv|flv|mpe?g|3gp|gif)$/i, PDF=/\.pdf$/i;
+const GROUPS={
+  img:{title:'Картинки',settings:{
+    q:{label:'Качество',opts:[['lossless','Без потерь'],['90','Высокое'],['80','Баланс'],['65','Компактно']],val:'80'},
+    w:{label:'Ширина',opts:[['0','Как есть'],['2560','2560'],['1920','1920'],['1280','1280'],['800','800']],val:'0'}}},
+  vid:{title:'Видео и GIF',settings:{
+    q:{label:'Качество',opts:[['85','Высокое'],['70','Баланс'],['55','Компактно']],val:'70'},
+    w:{label:'Ширина',opts:[['0','Как есть'],['1280','1280'],['720','720'],['480','480']],val:'720'},
+    fps:{label:'Плавность',opts:[['10','10 к/с'],['15','15 к/с'],['24','24 к/с'],['30','30 к/с']],val:'15'}}},
+  pdf:{title:'PDF',settings:{
+    t:{label:'Уложиться в',opts:[['5','5 МБ'],['10','10 МБ'],['20','20 МБ'],['50','50 МБ']],val:'20',custom:true}}}
+};
+let items=[],seq=0,busy=false,LATEST='',FFMPEG=true;
+
+function size(n){if(n<1024)return n+' Б';if(n<1048576)return Math.round(n/1024)+' КБ';return (n/1048576).toFixed(1).replace('.',',')+' МБ'}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function plural(n,a,b,c){const m=n%10,h=n%100;return m==1&&h!=11?a:(m>=2&&m<=4&&(h<10||h>=20)?b:c)}
+function kindOf(f){if(PDF.test(f.name)||f.type==='application/pdf')return'pdf';if(VID.test(f.name)||f.type.startsWith('video/'))return'vid';if(IMG.test(f.name)||f.type.startsWith('image/'))return'img';return null}
+function dur(s){s=Math.round(s);return s<60?s+' с':Math.floor(s/60)+' мин '+(s%60)+' с'}
+
+/* ---------- добавление файлов ---------- */
+function add(list){const bad=[];
+  for(const f of list){const k=kindOf(f);if(!k){bad.push(f.name);continue}
+    items.push({id:++seq,f,k,st:'new'})}
+  $('unsup').textContent=bad.length?`Не поддерживается: ${bad.join(', ')}`:'';
+  render()}
+
+/* ---------- отрисовка ---------- */
+function render(){
+  const has=items.length>0;
+  const d=$('drop');d.className='drop '+(has?'slim':'empty');
+  $('dropBig').style.display=$('dropSmall').style.display=$('kinds').style.display=has?'none':'';
+  d.querySelector('.slimtxt')?.remove();
+  if(has){const s=document.createElement('span');s.className='slimtxt';s.textContent='Добавить ещё файлы';d.appendChild(s)}
+  const box=$('groups');
+  for(const k of ['img','vid','pdf']){
+    const its=items.filter(i=>i.k===k);let g=$('g-'+k);
+    if(!its.length){g?.remove();continue}
+    if(!g){g=document.createElement('section');g.id='g-'+k;g.className='group '+k;g.innerHTML=groupHtml(k);
+      const next=['img','vid','pdf'].slice(['img','vid','pdf'].indexOf(k)+1).map(x=>$('g-'+x)).find(Boolean);
+      box.insertBefore(g,next||null);bindGroup(g,k)}
+    g.querySelector('.count').textContent=`${its.length} ${plural(its.length,'файл','файла','файлов')}`;
+    const ul=g.querySelector('.files');
+    for(const it of its)if(!it.el){it.el=fileEl(it);ul.appendChild(it.el)}
+    updateHints(k)}
+  updateDock()}
+
+function groupHtml(k){const G=GROUPS[k];
+  const sets=Object.entries(G.settings).map(([key,s])=>`<div class="setting"><label>${s.label}</label><div class="seg" data-k="${key}">${
+    s.opts.map(([v,t])=>`<button type="button" data-v="${v}" class="${v===s.val?'on':''}">${t}</button>`).join('')}</div>${
+    s.custom?`<input class="custom" type="number" min="1" step="1" placeholder="свой" aria-label="Свой размер в МБ">`:''}</div>`).join('');
+  return `<div class="ghead"><span class="bar"></span><h2>${G.title}</h2><span class="count"></span></div>
+  <div class="settings">${sets}<p class="hint"></p></div><ul class="files"></ul>`}
+
+function bindGroup(g,k){
+  g.querySelectorAll('.seg').forEach(seg=>seg.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;
+    seg.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
+    GROUPS[k].settings[seg.dataset.k].val=b.dataset.v;const c=g.querySelector('.custom');if(c&&seg.dataset.k==='t')c.value='';updateHints(k)}));
+  const c=g.querySelector('.custom');
+  if(c)c.addEventListener('input',()=>{if(c.value){g.querySelectorAll('.seg[data-k=t] button').forEach(x=>x.classList.remove('on'));GROUPS.pdf.settings.t.val=c.value}updateHints(k)})}
+
+function fileEl(it){const li=document.createElement('li');li.className='file';
+  let th;
+  if(it.k==='img'&&!/\.(heic|heif|tiff?)$/i.test(it.f.name)){th=`<img class="thumb" src="${URL.createObjectURL(it.f)}" alt="">`}
+  else if(it.k==='vid'&&!/\.gif$/i.test(it.f.name)){th=`<video class="thumb" muted preload="metadata" src="${URL.createObjectURL(it.f)}#t=0.1"></video>`}
+  else if(it.k==='vid'){th=`<img class="thumb" src="${URL.createObjectURL(it.f)}" alt="">`}
+  else th=`<div class="thumb">${it.k==='pdf'?'PDF':esc(it.f.name.split('.').pop().toUpperCase().slice(0,4))}</div>`;
+  li.innerHTML=`${th}<div style="min-width:0"><div class="fname">${esc(it.f.name)}</div><div class="fmeta"><span>${size(it.f.size)}</span><span class="extra"></span><span class="st"></span></div></div>
+  <div class="side"><button class="x" title="Убрать" aria-label="Убрать файл">×</button></div>`;
+  li.querySelector('.x').onclick=()=>{if(it.st==='work')return;items=items.filter(x=>x!==it);li.remove();render()};
+  const v=li.querySelector('video');
+  if(v)v.addEventListener('loadedmetadata',()=>{it.dur=v.duration;li.querySelector('.extra').textContent=isFinite(v.duration)?dur(v.duration):'';updateHints('vid')});
+  return li}
+
+function updateHints(k){const g=$('g-'+k);if(!g)return;const h=g.querySelector('.hint');h.className='hint';
+  const its=items.filter(i=>i.k===k&&i.st==='new');
+  if(k==='img'){const s=GROUPS.img.settings.q.val;h.textContent=s==='lossless'?'Без потерь подходит для логотипов, иконок и скриншотов. Для фото выберите «Высокое» или «Баланс».':'';}
+  if(k==='vid'){const long=its.filter(i=>i.dur>15);
+    if(!FFMPEG){h.className='hint warn';h.textContent='Для видео нужен ffmpeg, а он не установлен.'}
+    else if(long.length){h.className='hint warn';h.textContent=`${long.length>1?'Есть ролики':'Ролик'} длиннее 15 секунд — анимированный WebP получится тяжёлым. Уменьшите ширину или плавность.`}
+    else h.textContent='Звук не сохраняется: WebP — это анимация без звука.'}
+  if(k==='pdf'){const t=parseFloat(GROUPS.pdf.settings.t.val)||20;
+    for(const it of items.filter(i=>i.k==='pdf'&&i.st==='new'))it.el.querySelector('.extra').textContent=it.f.size<=t*1048576?'уже меньше лимита, только оптимизируем':'';
+    h.textContent='Если для этого придётся сильно ухудшить картинки, Конвертер спросит, оставить один файл или разделить на несколько.'}}
+
+function updateDock(){const pend=items.filter(i=>i.st==='new');const dock=$('dock');
+  dock.style.display=items.length?'block':'none';
+  const tot=pend.reduce((a,i)=>a+i.f.size,0);
+  $('sum').innerHTML=pend.length?`<b>${pend.length} ${plural(pend.length,'файл','файла','файлов')}</b> к конвертации, ${size(tot)}`:(busy?'Конвертирую…':(items.some(i=>i.st==='ask')?'<b>Нужно ваше решение</b> по PDF выше':'Готово. Результаты в папке «Загрузки/Конвертер».'));
+  const go=$('go');go.disabled=busy||!pend.length;go.textContent=busy?'Конвертирую…':(pend.length?`Конвертировать ${pend.length} ${plural(pend.length,'файл','файла','файлов')}`:'Конвертировать')}
+
+/* ---------- конвертация ---------- */
+function setSide(it,html){it.el.querySelector('.side').innerHTML=html}
+const CHECK='<svg class="done-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7"/></svg>';
+async function go(){if(busy)return;busy=true;
+  const queue=items.filter(i=>i.st==='new');
+  queue.forEach(i=>{i.st='wait';i.el.querySelector('.st').textContent='в очереди';setSide(i,'')});
+  updateDock();
+  for(const it of queue){it.st='work';const st=it.el.querySelector('.st');
+    st.textContent=it.k==='pdf'?'сжимаю, большие файлы — до пары минут':'конвертирую';setSide(it,'<div class="spin"></div>');
+    try{let r;
+      if(it.k==='pdf'){r=await fetch('/pdf/compress?'+new URLSearchParams({name:it.f.name,target:GROUPS.pdf.settings.t.val}),{method:'POST',body:it.f})}
+      else{const S=GROUPS[it.k].settings;const q=S.q.val;
+        const p={name:it.f.name,q:q==='lossless'?'90':q,lossless:q==='lossless'?'1':'0',w:S.w.val,fps:it.k==='vid'?S.fps.val:'15'};
+        r=await fetch('/convert?'+new URLSearchParams(p),{method:'POST',body:it.f})}
+      const j=await r.json();
+      if(!j.ok){it.st='err';st.innerHTML=`<span class="bad">${esc(j.error||'ошибка')}</span>`;setSide(it,'')}
+      else if(j.kind==='pdf')pdfDone(it,j);
+      else{it.st='done';const pct=Math.round((1-j.out/j.in)*100);
+        st.innerHTML=`→ ${size(j.out)} <span class="${pct>=0?'good':'bad'}">${pct>=0?'−'+pct:'+'+(-pct)}%</span>`;
+        setSide(it,`<a class="open" href="/out/${encodeURIComponent(j.name)}" target="_blank">Открыть</a>${CHECK}`)}}
+    catch(e){it.st='err';st.innerHTML='<span class="bad">нет связи — конвертер закрыт?</span>';setSide(it,'')}
+  }
+  busy=false;updateDock()}
+
+function showParts(it,saved){it.el.querySelector('.parts')?.remove();
+  const d=document.createElement('div');d.className='parts';
+  d.innerHTML=saved.map(x=>`<div class="part"><div>${esc(x.name)} <span>${size(x.size)}${x.pages?', стр. '+x.pages:''}${x.fits===false?', больше лимита':''}</span></div><a class="open" href="/out/${encodeURIComponent(x.name)}" target="_blank">Открыть</a></div>`).join('');
+  it.el.appendChild(d)}
+
+function pdfDone(it,j){const st=it.el.querySelector('.st');it.st='done';
+  st.innerHTML=`→ ${size(j.out)}, ${j.pages} ${plural(j.pages,'страница','страницы','страниц')}, ${esc(j.level)}`;
+  if(!j.choice){setSide(it,`<a class="open" href="/out/${encodeURIComponent(j.saved[0].name)}" target="_blank">Открыть</a>${CHECK}`);return}
+  it.st='ask';setSide(it,'');
+  const ch=document.createElement('div');ch.className='choice';
+  const why=j.fits?`Чтобы уложиться в ${j.target_mb} МБ, картинки внутри пришлось сильно сжать. Текст останется чётким, а фото и мелкие детали могут стать размытыми.`
+    :`Даже при максимальном сжатии получается ${size(j.out)}, а это больше ${j.target_mb} МБ.`;
+  ch.innerHTML=`<p>${why}</p><div class="row">
+    ${j.parts?`<button class="btn" data-a="split">Разделить на ${j.parts} ${plural(j.parts,'файл','файла','файлов')} с хорошим качеством</button>`:''}
+    <button class="btn ghost" data-a="keep">Оставить одним файлом, ${size(j.out)}</button>
+    <a class="btn ghost" href="/pdf/preview/${j.id}" target="_blank">Посмотреть результат</a></div>
+    <small>Один файл удобнее отправлять, если качество картинок не критично. Разделение сохраняет качество.</small>`;
+  it.el.appendChild(ch);
+  const act=async(url,label)=>{ch.innerHTML=`<div class="row"><div class="spin"></div><span>${label}</span></div>`;
+    try{const r=await (await fetch(url,{method:'POST'})).json();ch.remove();
+      if(!r.ok){st.innerHTML=`<span class="bad">${esc(r.error)}</span>`;return}
+      if(r.saved.length>1){st.textContent=`разделён на ${r.saved.length} ${plural(r.saved.length,'файл','файла','файлов')}`;showParts(it,r.saved);setSide(it,CHECK)}
+      else setSide(it,`<a class="open" href="/out/${encodeURIComponent(r.saved[0].name)}" target="_blank">Открыть</a>${CHECK}`);
+      it.st='done';updateDock()}catch(e){ch.innerHTML='<span class="bad">Нет связи — конвертер закрыт?</span>'}};
+  ch.querySelector('[data-a=keep]').onclick=()=>act(`/pdf/keep?id=${j.id}`,'Сохраняю…');
+  const s=ch.querySelector('[data-a=split]');if(s)s.onclick=()=>act(`/pdf/split?id=${j.id}&parts=${j.parts}`,`Делю на ${j.parts} ${plural(j.parts,'часть','части','частей')} и сжимаю…`)}
+
+/* ---------- события ---------- */
+const drop=$('drop'),pick=$('pick');
+drop.onclick=()=>pick.click();
+drop.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();pick.click()}};
+pick.onchange=()=>{add(pick.files);pick.value=''};
+['dragenter','dragover'].forEach(t=>window.addEventListener(t,e=>{e.preventDefault();drop.classList.add('over')}));
+['dragleave','drop'].forEach(t=>window.addEventListener(t,e=>{e.preventDefault();if(t==='drop'||!e.relatedTarget)drop.classList.remove('over')}));
+window.addEventListener('drop',e=>{if(e.dataTransfer?.files?.length)add(e.dataTransfer.files)});
+$('go').onclick=go;
+$('reset').onclick=()=>{if(busy)return;items=items.filter(i=>i.st==='ask');$('groups').innerHTML='';items.forEach(i=>i.el=null);
+  if(items.length){/* незавершённые решения по PDF оставляем */}render()};
+$('open').onclick=()=>fetch('/open',{method:'POST'});
+$('quit').onclick=()=>{fetch('/quit',{method:'POST'}).catch(()=>{});$('app').style.display='none';$('dock').style.display='none';$('bye').style.display='block'};
 setInterval(()=>fetch('/ping').catch(()=>{}),20000);
-$('quit').onclick=e=>{e.preventDefault();fetch('/quit',{method:'POST'}).catch(()=>{});document.querySelector('.wrap').style.display='none';$('bye').style.display='block'};
-let LATEST='';
+
+fetch('/status').then(r=>r.json()).then(s=>{$('ver').textContent='Версия '+s.version;FFMPEG=s.ffmpeg;
+  if(!s.ffmpeg)$('warn').style.display='block';if(s.migrated)$('note').style.display='block'});
 fetch('/update/check').then(r=>r.json()).then(u=>{if(!u.available)return;LATEST=u.latest;
-$('updTitle').textContent=`Доступно обновление ${u.latest}`;
-$('updNotes').innerHTML=(u.notes||[]).map(n=>`<li>${esc(n)}</li>`).join('')||'<li>Улучшения и исправления</li>';
-$('upd').style.display='block'}).catch(()=>{});
+  $('updTitle').textContent=`Доступно обновление ${u.latest}`;
+  $('updNotes').innerHTML=(u.notes||[]).map(n=>`<li>${esc(n)}</li>`).join('')||'<li>Улучшения и исправления</li>';
+  $('upd').style.display='block'}).catch(()=>{});
 $('updLater').onclick=()=>$('upd').style.display='none';
 $('updGo').onclick=async()=>{const b=$('updGo');b.disabled=true;$('updLater').disabled=true;$('updMsg').textContent='Скачиваю обновление…';
-try{const j=await (await fetch('/update/apply',{method:'POST'})).json();
-if(!j.ok){$('updMsg').textContent='Не получилось: '+j.error;b.disabled=false;$('updLater').disabled=false;return}
-$('updMsg').textContent='Перезапускаю…';
-for(let i=0;i<40;i++){await new Promise(r=>setTimeout(r,500));try{const r=await fetch('/status',{cache:'no-store'});const st=await r.json();if(st.version===LATEST){location.reload();return}}catch(e){}}
-$('updMsg').textContent='Перезапустите WebP.command вручную'}catch(e){$('updMsg').textContent='Нет связи с приложением'}};
-$('q').oninput=e=>$('qv').textContent=e.target.value;
-drop.onclick=()=>pick.click();
-pick.onchange=()=>{add(pick.files);pick.value=''};
-['dragenter','dragover'].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.add('over')}));
-['dragleave','drop'].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.remove('over')}));
-drop.addEventListener('drop',e=>add(e.dataTransfer.files));
-window.addEventListener('dragover',e=>e.preventDefault());window.addEventListener('drop',e=>e.preventDefault());
-$('open').onclick=()=>fetch('/open',{method:'POST'});
-$('clear').onclick=()=>{list.querySelectorAll('.item.done').forEach(n=>n.remove())};
-function add(files){for(const f of files){if(!f.size&&!f.type)continue;const el=document.createElement('div');el.className='item';
-el.innerHTML=`<div class="thumb"></div><div class="info"><div class="name">${esc(f.name)}</div><div class="meta">${size(f.size)} · в очереди</div></div>`;
-list.prepend(el);queue.push({f,el})}run()}
-function plural(n,one,few,many){const m10=n%10,m100=n%100;return m10==1&&m100!=11?one:(m10>=2&&m10<=4&&(m100<10||m100>=20)?few:many)}
-function showFiles(el,saved){const box=document.createElement('div');box.className='files';
-box.innerHTML=saved.map(x=>`<div class="f"><span>${esc(x.name)} · ${size(x.size)} · ${esc(x.level)}${x.pages?' · стр. '+x.pages:''}${x.fits===false?' · <b class="bad">больше лимита</b>':''}</span><a href="/out/${encodeURIComponent(x.name)}" target="_blank">Открыть</a></div>`).join('');el.appendChild(box)}
-async function pdfAction(el,url,label){const ch=el.querySelector('.choice');ch.innerHTML=`<div class="row"><div class="spin"></div><span>${label}</span></div>`;
-try{const j=await (await fetch(url,{method:'POST'})).json();ch.remove();
-if(j.ok){if(j.saved.length>1){const m=el.querySelector('.meta');m.textContent=m.textContent.replace(/ · [^·]+$/,` · разделён на ${j.saved.length} ${plural(j.saved.length,'файл','файла','файлов')}`)}showFiles(el,j.saved)}else el.querySelector('.meta').innerHTML=`<span class="bad">Ошибка: ${esc(j.error)}</span>`}
-catch(e){ch.innerHTML='<span class="bad">Нет связи — конвертер закрыт?</span>'}}
-function pdfResult(el,meta,j){const pct=Math.round((1-j.out/j.in)*100);
-meta.innerHTML=`${size(j.in)} → ${size(j.out)} · ${j.pages} ${plural(j.pages,'страница','страницы','страниц')} · ${esc(j.level)}`;
-if(!j.choice){showFiles(el,j.saved);return}
-const ch=document.createElement('div');ch.className='choice';
-const why=j.fits?`Чтобы уложиться в ${j.target_mb} МБ, картинки внутри PDF пришлось сильно сжать. Текст останется чётким, но фото и мелкие детали могут стать размытыми.`
-:`Даже при максимальном сжатии файл весит ${size(j.out)} — это больше ${j.target_mb} МБ.`;
-let html=`<p>${why} Как поступить?</p><div class="row"><a class="btn ghost" href="/pdf/preview/${j.id}" target="_blank">Посмотреть, как получилось</a>
-<button class="btn ghost" data-a="keep">Оставить одним файлом · ${size(j.out)}</button>`;
-if(j.parts)html+=`<button class="btn" data-a="split">Разделить на ${j.parts} ${plural(j.parts,'файл','файла','файлов')} · качество лучше</button>`;
-html+=`</div><div class="hint">Один файл удобнее отправлять, если качество картинок не критично. Разделение сохраняет качество, но получится несколько файлов.</div>`;
-ch.innerHTML=html;el.appendChild(ch);
-ch.querySelector('[data-a=keep]').onclick=()=>pdfAction(el,`/pdf/keep?id=${j.id}`,'Сохраняю…');
-const sp=ch.querySelector('[data-a=split]');if(sp)sp.onclick=()=>pdfAction(el,`/pdf/split?id=${j.id}&parts=${j.parts}`,`Делю на ${j.parts} ${plural(j.parts,'часть','части','частей')} и сжимаю…`)}
-async function run(){if(busy)return;busy=true;while(queue.length){const {f,el}=queue.shift();const meta=el.querySelector('.meta');
-const isPdf=/\.pdf$/i.test(f.name)||f.type==='application/pdf';
-meta.textContent=size(f.size)+(isPdf?' · сжимаю PDF… большие файлы — до пары минут':' · конвертирую…');const sp=document.createElement('div');sp.className='spin';el.appendChild(sp);
-if(isPdf)el.querySelector('.thumb').outerHTML='<div class="pdft">PDF</div>';
-try{let r;
-if(isPdf){const p=new URLSearchParams({name:f.name,target:$('pdfmb').value||'20'});r=await fetch('/pdf/compress?'+p,{method:'POST',body:f})}
-else{const p=new URLSearchParams({name:f.name,q:$('q').value,w:$('w').value||'0',fps:$('fps').value,lossless:$('lossless').checked?'1':'0'});r=await fetch('/convert?'+p,{method:'POST',body:f})}
-const j=await r.json();sp.remove();
-if(j.ok&&j.kind==='pdf')pdfResult(el,meta,j);
-else if(j.ok){const pct=Math.round((1-j.out/j.in)*100);const t=`/out/${encodeURIComponent(j.name)}?t=${Date.now()}`;
-el.querySelector('.thumb').outerHTML=`<img class="thumb" src="${t}" alt="">`;
-meta.innerHTML=`${size(j.in)} → ${size(j.out)} · <span class="${pct>=0?'good':'bad'}">${pct>=0?'−'+pct:'+'+(-pct)}%</span>`;
-const a=document.createElement('a');a.className='dl';a.href=t;a.download=j.name;a.textContent='Скачать';el.appendChild(a)}
-else meta.innerHTML=`<span class="bad">Ошибка: ${esc(j.error||'неизвестно')}</span>`}
-catch(e){sp.remove();meta.innerHTML='<span class="bad">Нет связи — конвертер закрыт? Запустите значок «Конвертер»</span>'}
-el.classList.add('done')}busy=false}
-</script></body></html>"""
+  try{const j=await (await fetch('/update/apply',{method:'POST'})).json();
+    if(!j.ok){$('updMsg').textContent='Не получилось: '+j.error;b.disabled=false;$('updLater').disabled=false;return}
+    $('updMsg').textContent='Перезапускаю…';
+    for(let i=0;i<40;i++){await new Promise(r=>setTimeout(r,500));try{const st=await (await fetch('/status',{cache:'no-store'})).json();if(st.version===LATEST){location.reload();return}}catch(e){}}
+    $('updMsg').textContent='Перезапустите Конвертер вручную'}catch(e){$('updMsg').textContent='Нет связи с конвертером'}};
+</script></body></html>
+"""
 
 
 def main():
