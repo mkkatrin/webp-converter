@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Конвертер — перевод картинок и видео в WebP, с окном в браузере.
+Конвертер — картинки и видео в WebP, сжатие PDF до нужного размера. Окно в браузере.
 
 Запуск:  python3 webp_app.py            (или значок «Конвертер» на macOS)
          python3 webp_app.py --install  (создать приложение «Конвертер»)
 Откроется страница в браузере: перетащите туда картинки или видео.
-Готовые файлы сохраняются в папку «Загрузки/WebP».
+Готовые файлы сохраняются в папку «Загрузки/Конвертер».
 
-Нужно: Pillow (pip install pillow), для видео — ffmpeg.
+Нужно: Pillow, pikepdf (ставится сам), для видео — ffmpeg.
 Необязательно: pillow-heif — для фото iPhone в формате HEIC.
 """
 import json
@@ -23,11 +23,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.1"
+VERSION = "1.2"
 REPO_RAW = os.environ.get("WEBP_REPO", "https://raw.githubusercontent.com/mkkatrin/webp-converter/main/")
 APP_FILE = Path(__file__).resolve()
 
-OUT_DIR = Path.home() / "Downloads" / "WebP"
+OUT_DIR = Path.home() / "Downloads" / "Конвертер"
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".avif", ".ico", ".webp"}
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg", ".3gp", ".gif"}
 
@@ -89,6 +89,247 @@ def unique(path: Path) -> Path:
         if not p.exists():
             return p
         i += 1
+
+
+# ---------- Сжатие PDF ----------
+# Уровни: (макс. dpi картинок, качество JPEG, подпись). 0 — без потерь.
+PDF_LEVELS = [
+    (None, None, "без потерь"),
+    (200, 85, "почти без потерь"),
+    (150, 75, "хорошее качество"),
+    (110, 65, "заметное сжатие"),
+    (85, 55, "сильное сжатие"),
+    (72, 40, "очень сильное сжатие"),
+]
+PDF_STRONG = 4          # с этого уровня считаем потерю качества сильной
+PDF_GOOD = 2            # уровень, который стараемся сохранить при разделении
+PDF_STATE = {"status": "checking", "error": ""}
+JOBS = {}
+WORK_DIR = Path(tempfile.mkdtemp(prefix="converter-"))
+
+
+def ensure_pdf_lib():
+    """Ставит pikepdf в окружение приложения, если его ещё нет (один раз)."""
+    try:
+        import pikepdf  # noqa: F401
+        PDF_STATE["status"] = "ready"
+        return
+    except ImportError:
+        pass
+    PDF_STATE["status"] = "installing"
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--disable-pip-version-check", "pikepdf"],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        import importlib
+        importlib.invalidate_caches()
+        PDF_STATE["status"] = "ready"
+    else:
+        PDF_STATE["status"] = "error"
+        PDF_STATE["error"] = (r.stderr or r.stdout).strip()[-300:]
+
+
+def wait_pdf_lib(timeout=600):
+    t0 = time.time()
+    while PDF_STATE["status"] in ("checking", "installing") and time.time() - t0 < timeout:
+        time.sleep(0.5)
+    if PDF_STATE["status"] != "ready":
+        raise RuntimeError("модуль для PDF не установился. Проверьте интернет и перезапустите Конвертер. "
+                           + PDF_STATE.get("error", ""))
+
+
+def _image_weights(pdf):
+    """Для каждой картинки — самая большая страница, на которой она стоит (в дюймах),
+    и «вес» каждой страницы (сколько байт картинок на ней) для деления на части."""
+    import pikepdf
+    pages_in = {}
+    weights = []
+    for page in pdf.pages:
+        box = page.mediabox
+        w_in = abs(float(box[2]) - float(box[0])) / 72
+        h_in = abs(float(box[3]) - float(box[1])) / 72
+        side = max(w_in, h_in) or 11.7
+        wsum = 0
+        try:
+            imgs = page.images
+        except Exception:
+            imgs = {}
+        for _, raw in imgs.items():
+            if not isinstance(raw, pikepdf.Stream):
+                continue
+            key = raw.objgen
+            pages_in[key] = max(pages_in.get(key, 0), side)
+            try:
+                wsum += int(raw.get("/Length", 0))
+            except Exception:
+                pass
+        weights.append(wsum + 5000)
+    return pages_in, weights
+
+
+def _recompress_images(pdf, max_dpi, quality):
+    import io
+    import pikepdf
+    from pikepdf import Name, PdfImage
+    from PIL import Image
+    pages_in, _ = _image_weights(pdf)
+    done = set()
+    for page in pdf.pages:
+        try:
+            imgs = page.images
+        except Exception:
+            continue
+        for _, raw in imgs.items():
+            if not isinstance(raw, pikepdf.Stream) or raw.objgen in done:
+                continue
+            done.add(raw.objgen)
+            try:
+                if raw.get("/ImageMask", False) or int(raw.get("/BitsPerComponent", 8)) < 8:
+                    continue  # чёрно-белые маски и сканы 1-бит не трогаем
+                old_len = int(raw.get("/Length", 0))
+                if old_len < 15000:
+                    continue
+                pil = PdfImage(raw).as_pil_image()
+                if pil.mode in ("L", "LA", "I", "I;16", "1"):
+                    pil, cs = pil.convert("L"), Name.DeviceGray
+                else:
+                    pil, cs = pil.convert("RGB"), Name.DeviceRGB
+                side_in = pages_in.get(raw.objgen, 11.7)
+                max_px = int(max_dpi * side_in)
+                if max(pil.size) > max_px:
+                    k = max_px / max(pil.size)
+                    pil = pil.resize((max(1, round(pil.width * k)), max(1, round(pil.height * k))), Image.LANCZOS)
+                buf = io.BytesIO()
+                pil.save(buf, "JPEG", quality=quality, optimize=True, progressive=True)
+                data = buf.getvalue()
+                if len(data) >= old_len * 0.95:
+                    continue  # не стало меньше — оставляем как было
+                raw.write(data, filter=Name.DCTDecode)
+                raw.Width, raw.Height = pil.width, pil.height
+                raw.ColorSpace = cs
+                raw.BitsPerComponent = 8
+                for k in ("/DecodeParms", "/Decode"):
+                    if k in raw:
+                        del raw[k]
+                if "/Mask" in raw and isinstance(raw.Mask, pikepdf.Array):
+                    del raw["/Mask"]
+            except Exception:
+                continue  # необычную картинку оставляем как есть
+
+
+def pdf_at_level(src, dst, level, pages=None):
+    """Сохраняет src (или только страницы pages) в dst со сжатием уровня level."""
+    import pikepdf
+    with pikepdf.open(src) as pdf:
+        if pages is not None:
+            keep = set(pages)
+            for i in range(len(pdf.pages) - 1, -1, -1):
+                if i not in keep:
+                    del pdf.pages[i]
+        dpi, q, _ = PDF_LEVELS[level]
+        if dpi:
+            _recompress_images(pdf, dpi, q)
+        try:
+            pdf.remove_unreferenced_resources()
+        except Exception:
+            pass
+        pdf.save(dst, compress_streams=True, recompress_flate=True,
+                 object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    return Path(dst).stat().st_size
+
+
+def pdf_fit(src, dst, target, pages=None, start=0):
+    """Подбирает самый мягкий уровень, при котором файл влезает в target.
+    Возвращает (уровень, размер, {уровень: размер})."""
+    sizes = {}
+    for lvl in range(start, len(PDF_LEVELS)):
+        tmp = Path(str(dst) + f".l{lvl}")
+        sizes[lvl] = pdf_at_level(src, tmp, lvl, pages)
+        if sizes[lvl] <= target or lvl == len(PDF_LEVELS) - 1:
+            os.replace(tmp, dst)
+            for other in Path(dst).parent.glob(Path(dst).name + ".l*"):
+                other.unlink()
+            return lvl, sizes[lvl], sizes
+    raise RuntimeError("не удалось сжать")
+
+
+def split_pages(weights, parts):
+    """Делит страницы на parts кусков подряд, примерно равных по «весу»."""
+    n = len(weights)
+    parts = max(1, min(parts, n))
+    total = sum(weights)
+    groups, cur, acc, left = [], [], 0, parts
+    for i, w in enumerate(weights):
+        cur.append(i)
+        acc += w
+        remaining_pages = n - i - 1
+        if left > 1 and (acc >= total / parts * (len(groups) + 1) - w / 2 or remaining_pages == left - 1):
+            groups.append(cur)
+            cur, left = [], left - 1
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def pdf_compress_job(src, name, target_mb):
+    import pikepdf
+    target = int(target_mb * 1024 * 1024)
+    in_size = Path(src).stat().st_size
+    try:
+        with pikepdf.open(src) as pdf:
+            n_pages = len(pdf.pages)
+            _, weights = _image_weights(pdf)
+    except pikepdf.PasswordError:
+        raise RuntimeError("PDF защищён паролем — снимите пароль и попробуйте снова")
+    jid = os.urandom(6).hex()
+    res = WORK_DIR / f"{jid}.pdf"
+    lvl, size, sizes = pdf_fit(src, res, target)
+    job = {"src": str(src), "name": name, "res": str(res), "target": target,
+           "weights": weights, "pages": n_pages, "level": lvl, "size": size}
+    JOBS[jid] = job
+    fits = size <= target
+    strong = lvl >= PDF_STRONG or not fits
+    parts = 0
+    if strong and n_pages > 1:
+        # сколько частей нужно, чтобы остаться на «хорошем качестве»
+        good_size = sizes.get(PDF_GOOD) or size
+        parts = max(2, -(-int(good_size * 1.08) // target))
+        parts = min(parts, n_pages, 10)
+    out = {"ok": True, "kind": "pdf", "id": jid, "in": in_size, "out": size, "pages": n_pages,
+           "level": PDF_LEVELS[lvl][2], "level_n": lvl, "fits": fits, "target_mb": target_mb,
+           "choice": strong, "parts": parts, "dpi": PDF_LEVELS[lvl][0]}
+    if not strong:
+        out.update(pdf_keep(jid))
+    return out
+
+
+def _out_name(stem, suffix):
+    return unique(OUT_DIR / f"{stem}{suffix}")
+
+
+def pdf_keep(jid):
+    job = JOBS[jid]
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    dst = _out_name(Path(job["name"]).stem, " (сжатый).pdf")
+    shutil.copy2(job["res"], dst)
+    return {"saved": [{"name": dst.name, "url": "/out/" + quote(dst.name), "size": dst.stat().st_size,
+                       "level": PDF_LEVELS[job["level"]][2]}]}
+
+
+def pdf_split(jid, parts):
+    job = JOBS[jid]
+    groups = split_pages(job["weights"], max(2, parts))
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    stem = Path(job["name"]).stem
+    saved = []
+    for i, pages in enumerate(groups, 1):
+        tmp = WORK_DIR / f"{jid}-p{i}.pdf"
+        lvl, size, _ = pdf_fit(job["src"], tmp, job["target"], pages=pages)
+        dst = _out_name(stem, f" — часть {i} из {len(groups)}.pdf")
+        shutil.move(str(tmp), dst)
+        saved.append({"name": dst.name, "url": "/out/" + quote(dst.name), "size": size,
+                      "level": PDF_LEVELS[lvl][2], "pages": f"{pages[0] + 1}–{pages[-1] + 1}",
+                      "fits": size <= job["target"]})
+    return {"saved": saved}
 
 
 # ---------- Приложение «Конвертер» для macOS (запуск без Терминала) ----------
@@ -242,6 +483,7 @@ def apply_update():
 
 
 def restart(port):
+    shutil.rmtree(WORK_DIR, ignore_errors=True)
     env = dict(os.environ, WEBP_NO_BROWSER="1", WEBP_PORT=str(port))
     os.execve(sys.executable, [sys.executable, str(APP_FILE)], env)
 
@@ -270,13 +512,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
         elif u.path == "/status":
             self._json({"ffmpeg": bool(find_ffmpeg()), "out": str(OUT_DIR), "version": VERSION,
-                        "migrated": MIGRATED[0], "app": sys.platform == "darwin"})
+                        "migrated": MIGRATED[0], "app": sys.platform == "darwin",
+                        "pdf": PDF_STATE["status"]})
+        elif u.path.startswith("/pdf/preview/"):
+            job = JOBS.get(u.path.rsplit("/", 1)[-1])
+            if job and Path(job["res"]).is_file():
+                self._send(200, Path(job["res"]).read_bytes(), "application/pdf")
+            else:
+                self._send(404, b"not found", "text/plain")
         elif u.path == "/update/check":
             self._json(check_update())
         elif u.path.startswith("/out/"):
             f = OUT_DIR / Path(unquote(u.path[5:])).name
             if f.is_file():
-                self._send(200, f.read_bytes(), "image/webp")
+                ctype = "application/pdf" if f.suffix.lower() == ".pdf" else "image/webp"
+                self._send(200, f.read_bytes(), ctype)
             else:
                 self._send(404, b"not found", "text/plain")
         else:
@@ -301,6 +551,40 @@ class Handler(BaseHTTPRequestHandler):
             port = self.server.server_address[1]
             threading.Timer(0.5, restart, args=(port,)).start()
             return
+
+        if u.path == "/pdf/compress":
+            name = Path(g("name", "file.pdf")).name
+            try:
+                target_mb = max(0.5, float(g("target", "20") or 20))
+            except ValueError:
+                target_mb = 20.0
+            src = WORK_DIR / (os.urandom(6).hex() + ".src.pdf")
+            with open(src, "wb") as f:
+                left = length
+                while left > 0:
+                    chunk = self.rfile.read(min(1 << 20, left))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    left -= len(chunk)
+            try:
+                wait_pdf_lib()
+                return self._json(pdf_compress_job(src, name, target_mb))
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)})
+
+        if u.path in ("/pdf/keep", "/pdf/split"):
+            jid = g("id")
+            if jid not in JOBS:
+                return self._json({"ok": False, "error": "задача не найдена — загрузите PDF ещё раз"})
+            try:
+                if u.path == "/pdf/keep":
+                    r = pdf_keep(jid)
+                else:
+                    r = pdf_split(jid, int(g("parts", "2") or 2))
+                return self._json(dict(ok=True, **r))
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)})
 
         if u.path == "/quit":
             self._json({"ok": True})
@@ -399,6 +683,17 @@ input[type=number],select{width:100%;padding:7px 10px;border:1px solid var(--lin
 .upd .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .upd .msg{font-size:14px;color:var(--muted)}
 .ver{color:var(--muted);font-size:12px;margin-top:14px;text-align:center}
+.item{flex-wrap:wrap}
+.pdft{width:56px;height:56px;border-radius:10px;background:#e5484d;color:#fff;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:center;flex:none}
+.choice{flex-basis:100%;margin-top:4px;padding:12px 14px;border-radius:12px;background:var(--bg);font-size:14px}
+.choice p{margin:0 0 10px}
+.choice .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.choice .btn{padding:8px 12px;font-size:14px;text-decoration:none;display:inline-block}
+.choice .hint{color:var(--muted);font-size:13px;margin-top:8px}
+.files{flex-basis:100%;display:flex;flex-direction:column;gap:4px;margin-top:4px}
+.files .f{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:6px 10px;border-radius:8px;background:var(--bg)}
+.files .f a{color:var(--accent);font-weight:600;text-decoration:none;white-space:nowrap}
+.files .f span{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .ver a{color:var(--muted);margin-left:10px}
 .note{display:none;margin:0 0 18px;padding:14px 16px;border-radius:14px;background:rgba(31,157,85,.1);border:1px solid var(--ok);font-size:14px}
 .note b{display:block;font-size:15px;margin-bottom:4px}
@@ -406,7 +701,7 @@ input[type=number],select{width:100%;padding:7px 10px;border:1px solid var(--lin
 .bye b{display:block;color:var(--text);font-size:20px;margin-bottom:6px}
 </style></head><body><div class="wrap">
 <h1>Конвертер</h1>
-<p class="sub">Картинки и видео → WebP. Всё обрабатывается на этом компьютере.</p>
+<p class="sub">Картинки и видео → WebP, PDF → сжатие до нужного размера. Всё обрабатывается на этом компьютере.</p>
 
 <div class="note" id="note"><b>Теперь без Терминала</b>Конвертер запускается значком «Конвертер» на Рабочем столе или в Launchpad. Окно Терминала можно закрыть — при следующем запуске оно больше не появится.</div>
 
@@ -420,8 +715,8 @@ input[type=number],select{width:100%;padding:7px 10px;border:1px solid var(--lin
 <div class="drop" id="drop">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
   <div class="big">Перетащите сюда файлы</div>
-  <div class="small">или нажмите, чтобы выбрать · JPG, PNG, HEIC, GIF, MP4, MOV…</div>
-  <input type="file" id="pick" multiple accept="image/*,video/*,.heic,.heif" hidden>
+  <div class="small">или нажмите, чтобы выбрать · JPG, PNG, HEIC, GIF, MP4, MOV, PDF…</div>
+  <input type="file" id="pick" multiple accept="image/*,video/*,.heic,.heif,.pdf,application/pdf" hidden>
 </div>
 <div class="warn" id="warn">ffmpeg не найден — картинки конвертируются, а видео и GIF нет. Установите: <b>brew install ffmpeg</b> и перезапустите приложение.</div>
 
@@ -429,6 +724,7 @@ input[type=number],select{width:100%;padding:7px 10px;border:1px solid var(--lin
   <div><label>Качество: <b id="qv">80</b></label><input type="range" id="q" min="10" max="100" value="80"></div>
   <div><label>Макс. ширина, px</label><input type="number" id="w" placeholder="как в оригинале" min="16" step="10"></div>
   <div><label>Кадров/с для видео</label><select id="fps"><option>8</option><option>10</option><option>12</option><option selected>15</option><option>20</option><option>24</option><option>30</option></select></div>
+  <div><label>PDF: сжать до, МБ</label><input type="number" id="pdfmb" value="20" min="1" step="1"></div>
   <div><label class="chk"><input type="checkbox" id="lossless"> Без потерь</label></div>
 </div>
 
@@ -436,7 +732,7 @@ input[type=number],select{width:100%;padding:7px 10px;border:1px solid var(--lin
 
 <div class="foot">
   <span class="path" id="path"></span>
-  <span><button class="btn ghost" id="clear">Очистить список</button> <button class="btn" id="open">Открыть папку WebP</button></span>
+  <span><button class="btn ghost" id="clear">Очистить список</button> <button class="btn" id="open">Открыть папку</button></span>
 </div>
 <div class="ver"><span id="ver"></span><a href="#" id="quit">Закрыть конвертер</a></div>
 </div>
@@ -475,11 +771,36 @@ $('clear').onclick=()=>{list.querySelectorAll('.item.done').forEach(n=>n.remove(
 function add(files){for(const f of files){if(!f.size&&!f.type)continue;const el=document.createElement('div');el.className='item';
 el.innerHTML=`<div class="thumb"></div><div class="info"><div class="name">${esc(f.name)}</div><div class="meta">${size(f.size)} · в очереди</div></div>`;
 list.prepend(el);queue.push({f,el})}run()}
+function plural(n,one,few,many){const m10=n%10,m100=n%100;return m10==1&&m100!=11?one:(m10>=2&&m10<=4&&(m100<10||m100>=20)?few:many)}
+function showFiles(el,saved){const box=document.createElement('div');box.className='files';
+box.innerHTML=saved.map(x=>`<div class="f"><span>${esc(x.name)} · ${size(x.size)} · ${esc(x.level)}${x.pages?' · стр. '+x.pages:''}${x.fits===false?' · <b class="bad">больше лимита</b>':''}</span><a href="/out/${encodeURIComponent(x.name)}" target="_blank">Открыть</a></div>`).join('');el.appendChild(box)}
+async function pdfAction(el,url,label){const ch=el.querySelector('.choice');ch.innerHTML=`<div class="row"><div class="spin"></div><span>${label}</span></div>`;
+try{const j=await (await fetch(url,{method:'POST'})).json();ch.remove();
+if(j.ok){if(j.saved.length>1){const m=el.querySelector('.meta');m.textContent=m.textContent.replace(/ · [^·]+$/,` · разделён на ${j.saved.length} ${plural(j.saved.length,'файл','файла','файлов')}`)}showFiles(el,j.saved)}else el.querySelector('.meta').innerHTML=`<span class="bad">Ошибка: ${esc(j.error)}</span>`}
+catch(e){ch.innerHTML='<span class="bad">Нет связи — конвертер закрыт?</span>'}}
+function pdfResult(el,meta,j){const pct=Math.round((1-j.out/j.in)*100);
+meta.innerHTML=`${size(j.in)} → ${size(j.out)} · ${j.pages} ${plural(j.pages,'страница','страницы','страниц')} · ${esc(j.level)}`;
+if(!j.choice){showFiles(el,j.saved);return}
+const ch=document.createElement('div');ch.className='choice';
+const why=j.fits?`Чтобы уложиться в ${j.target_mb} МБ, картинки внутри PDF пришлось сильно сжать. Текст останется чётким, но фото и мелкие детали могут стать размытыми.`
+:`Даже при максимальном сжатии файл весит ${size(j.out)} — это больше ${j.target_mb} МБ.`;
+let html=`<p>${why} Как поступить?</p><div class="row"><a class="btn ghost" href="/pdf/preview/${j.id}" target="_blank">Посмотреть, как получилось</a>
+<button class="btn ghost" data-a="keep">Оставить одним файлом · ${size(j.out)}</button>`;
+if(j.parts)html+=`<button class="btn" data-a="split">Разделить на ${j.parts} ${plural(j.parts,'файл','файла','файлов')} · качество лучше</button>`;
+html+=`</div><div class="hint">Один файл удобнее отправлять, если качество картинок не критично. Разделение сохраняет качество, но получится несколько файлов.</div>`;
+ch.innerHTML=html;el.appendChild(ch);
+ch.querySelector('[data-a=keep]').onclick=()=>pdfAction(el,`/pdf/keep?id=${j.id}`,'Сохраняю…');
+const sp=ch.querySelector('[data-a=split]');if(sp)sp.onclick=()=>pdfAction(el,`/pdf/split?id=${j.id}&parts=${j.parts}`,`Делю на ${j.parts} ${plural(j.parts,'часть','части','частей')} и сжимаю…`)}
 async function run(){if(busy)return;busy=true;while(queue.length){const {f,el}=queue.shift();const meta=el.querySelector('.meta');
-meta.textContent=size(f.size)+' · конвертирую…';const sp=document.createElement('div');sp.className='spin';el.appendChild(sp);
-const p=new URLSearchParams({name:f.name,q:$('q').value,w:$('w').value||'0',fps:$('fps').value,lossless:$('lossless').checked?'1':'0'});
-try{const r=await fetch('/convert?'+p,{method:'POST',body:f});const j=await r.json();sp.remove();
-if(j.ok){const pct=Math.round((1-j.out/j.in)*100);const t=`/out/${encodeURIComponent(j.name)}?t=${Date.now()}`;
+const isPdf=/\.pdf$/i.test(f.name)||f.type==='application/pdf';
+meta.textContent=size(f.size)+(isPdf?' · сжимаю PDF… большие файлы — до пары минут':' · конвертирую…');const sp=document.createElement('div');sp.className='spin';el.appendChild(sp);
+if(isPdf)el.querySelector('.thumb').outerHTML='<div class="pdft">PDF</div>';
+try{let r;
+if(isPdf){const p=new URLSearchParams({name:f.name,target:$('pdfmb').value||'20'});r=await fetch('/pdf/compress?'+p,{method:'POST',body:f})}
+else{const p=new URLSearchParams({name:f.name,q:$('q').value,w:$('w').value||'0',fps:$('fps').value,lossless:$('lossless').checked?'1':'0'});r=await fetch('/convert?'+p,{method:'POST',body:f})}
+const j=await r.json();sp.remove();
+if(j.ok&&j.kind==='pdf')pdfResult(el,meta,j);
+else if(j.ok){const pct=Math.round((1-j.out/j.in)*100);const t=`/out/${encodeURIComponent(j.name)}?t=${Date.now()}`;
 el.querySelector('.thumb').outerHTML=`<img class="thumb" src="${t}" alt="">`;
 meta.innerHTML=`${size(j.in)} → ${size(j.out)} · <span class="${pct>=0?'good':'bad'}">${pct>=0?'−'+pct:'+'+(-pct)}%</span>`;
 const a=document.createElement('a');a.className='dl';a.href=t;a.download=j.name;a.textContent='Скачать';el.appendChild(a)}
@@ -494,6 +815,7 @@ def main():
         install_bundle(force=True)
         print(f"Приложение «{APP_NAME}» создано:", BUNDLE)
         return
+    threading.Thread(target=ensure_pdf_lib, daemon=True).start()
     try:
         MIGRATED[0] = install_bundle()
     except Exception as e:
@@ -518,6 +840,8 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        shutil.rmtree(WORK_DIR, ignore_errors=True)
 
 
 if __name__ == "__main__":

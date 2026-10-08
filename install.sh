@@ -36,8 +36,8 @@ if [ ! -x .venv/bin/python ]; then
   echo "→ Создаю окружение Python"
   python3 -m venv .venv || { echo "Не удалось создать окружение Python"; finish 1; }
 fi
-echo "→ Устанавливаю библиотеки для картинок (около минуты)"
-.venv/bin/pip install -q --disable-pip-version-check pillow pillow-heif \
+echo "→ Устанавливаю библиотеки для картинок и PDF (около минуты)"
+.venv/bin/pip install -q --disable-pip-version-check pillow pillow-heif pikepdf \
   || { echo "Не удалось установить библиотеки. Проверьте интернет."; finish 1; }
 
 # 4. Приложение «Конвертер» (запуск без Терминала)
