@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Конвертер — картинки и видео в WebP, сжатие PDF до нужного размера. Окно в браузере.
+Конвертер — картинки и видео в WebP, сжатие PDF и PDF → PowerPoint. Окно в браузере.
 
 Запуск:  python3 webp_app.py            (или значок «Конвертер» на macOS)
          python3 webp_app.py --install  (создать приложение «Конвертер»)
@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.4"
+VERSION = "1.5"
 REPO_RAW = os.environ.get("WEBP_REPO", "https://raw.githubusercontent.com/mkkatrin/webp-converter/main/")
 APP_FILE = Path(__file__).resolve()
 
@@ -110,16 +110,23 @@ JOBS = {}
 WORK_DIR = Path(tempfile.mkdtemp(prefix="converter-"))
 
 
+PDF_DEPS = [("pikepdf", "pikepdf"), ("pypdfium2", "pypdfium2>=5,<6"), ("pptx", "python-pptx>=1,<2")]
+
+
 def ensure_pdf_lib():
-    """Ставит pikepdf в окружение приложения, если его ещё нет (один раз)."""
-    try:
-        import pikepdf  # noqa: F401
+    """Ставит модули для PDF и PowerPoint в окружение приложения, если их ещё нет (один раз)."""
+    import importlib
+    missing = []
+    for mod, spec in PDF_DEPS:
+        try:
+            importlib.import_module(mod)
+        except ImportError:
+            missing.append(spec)
+    if not missing:
         PDF_STATE["status"] = "ready"
         return
-    except ImportError:
-        pass
     PDF_STATE["status"] = "installing"
-    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--disable-pip-version-check", "pikepdf"],
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--disable-pip-version-check"] + missing,
                        capture_output=True, text=True)
     if r.returncode == 0:
         import importlib
@@ -399,6 +406,241 @@ def pdf_split(jid, parts):
     return {"saved": saved}
 
 
+# ---------- PDF → PowerPoint ----------
+def _font_family(raw_name):
+    """'ABCDEF+OpenSans-SemiBold' → ('Open Sans', 'SemiBold')."""
+    import re
+    name = raw_name.split("+", 1)[-1]
+    fam, _, style = name.partition("-")
+    if "," in fam:
+        fam, _, style = fam.partition(",")
+    fam = re.sub(r"(PSMT|MT|PS)$", "", fam)
+    fam = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", fam).strip()
+    return fam or "Arial", style
+
+
+def _page_chars(page, c):
+    """Символы страницы с координатами, шрифтом, размером и цветом (через PDFium)."""
+    import ctypes
+    # масштаб и шрифт каждого текстового объекта: в некоторых PDF размер шрифта = 1,
+    # а настоящий размер задан масштабом объекта
+    objinfo = {}
+    fbuf = ctypes.create_string_buffer(256)
+    for obj in page.get_objects(max_depth=20):
+        if obj.type != c.FPDF_PAGEOBJ_TEXT:
+            continue
+        try:
+            m = obj.get_matrix()
+            sc = abs(m.a * m.d - m.b * m.c) ** 0.5 or 1.0
+        except Exception:
+            sc = 1.0
+        fname = ""
+        try:
+            f = c.FPDFTextObj_GetFont(obj.raw)
+            if f and c.FPDFFont_GetBaseFontName(f, fbuf, 256):
+                fname = fbuf.value.decode("utf-8", "ignore")
+        except Exception:
+            pass
+        objinfo[ctypes.cast(obj.raw, ctypes.c_void_p).value] = (sc, fname)
+    tp = page.get_textpage()
+    out = []
+    buf = ctypes.create_string_buffer(256)
+    flags = ctypes.c_int()
+    rect = c.FS_RECTF()
+    rr, gg, bb, aa = (ctypes.c_uint() for _ in range(4))
+    for k in range(tp.count_chars()):
+        u = c.FPDFText_GetUnicode(tp.raw, k)
+        if u in (0xFFFE, 0xFFFF):
+            continue
+        ch = chr(u)
+        gen = c.FPDFText_IsGenerated(tp.raw, k) == 1
+        if gen:
+            out.append({"ch": ch, "gen": True})
+            continue
+        obj = c.FPDFText_GetTextObject(tp.raw, k)
+        key = ctypes.cast(obj, ctypes.c_void_p).value if obj else None
+        c.FPDFText_GetLooseCharBox(tp.raw, k, ctypes.byref(rect))
+        size = c.FPDFText_GetFontSize(tp.raw, k)
+        n = c.FPDFText_GetFontInfo(tp.raw, k, buf, 256, ctypes.byref(flags))
+        fname = buf.value.decode("utf-8", "ignore") if n else ""
+        sc, ofont = objinfo.get(key, (1.0, ""))
+        if size <= 1.5 and sc > 1.5:
+            size = size * sc
+        fname = fname or ofont
+        weight = c.FPDFText_GetFontWeight(tp.raw, k)
+        col = (255, 255, 255)
+        if c.FPDFText_GetFillColor(tp.raw, k, ctypes.byref(rr), ctypes.byref(gg), ctypes.byref(bb), ctypes.byref(aa)):
+            col = (rr.value, gg.value, bb.value)
+        out.append({"ch": ch, "gen": False, "obj": key, "l": rect.left, "r": rect.right,
+                    "t": rect.top, "b": rect.bottom, "size": size, "font": fname,
+                    "weight": weight, "color": col, "italic": bool(flags.value & 64)})
+    tp.close()
+    return out
+
+
+def _hide_text(page, c):
+    """Делает прямой (не повёрнутый) видимый текст невидимым, чтобы получить фон без текста.
+    Возвращает множество скрытых текстовых объектов."""
+    import ctypes
+    hidden = set()
+    for obj in page.get_objects(max_depth=20):
+        if obj.type != c.FPDF_PAGEOBJ_TEXT:
+            continue
+        mode = c.FPDFTextObj_GetTextRenderMode(obj.raw)
+        if mode == c.FPDF_TEXTRENDERMODE_INVISIBLE:
+            continue
+        try:
+            m = obj.get_matrix()
+            a, b, cc, d = m.a, m.b, m.c, m.d
+        except Exception:
+            a, b, cc, d = 1, 0, 0, 1
+        if abs(b) > 1e-3 or abs(cc) > 1e-3 or a <= 0 or d <= 0:
+            continue  # повёрнутый или отражённый текст оставляем на фоне
+        c.FPDFTextObj_SetTextRenderMode(obj.raw, c.FPDF_TEXTRENDERMODE_INVISIBLE)
+        hidden.add(ctypes.cast(obj.raw, ctypes.c_void_p).value)
+    if hidden:
+        page.gen_content()
+    return hidden
+
+
+def _lines_from_chars(chars, hidden):
+    """Собирает символы в строки (и куски строк, если между словами большой разрыв)."""
+    lines, cur, prev = [], [], None
+
+    def flush():
+        nonlocal cur
+        if any(ch["ch"].strip() for ch in cur if not ch.get("gen")):
+            lines.append(cur)
+        cur = []
+
+    for ch in chars:
+        if ch.get("gen"):
+            if ch["ch"] in "\r\n":
+                flush()
+                prev = None
+            elif ch["ch"] == " " and cur:
+                cur.append({"ch": " ", "gen": True})
+            continue
+        if ch["obj"] not in hidden:
+            continue
+        if prev is not None:
+            sz = max(prev["size"], ch["size"], 1)
+            new_line = abs(ch["b"] - prev["b"]) > 0.35 * sz or ch["l"] < prev["l"] - sz
+            gap = ch["l"] - prev["r"] > 2.5 * sz
+            if new_line or gap:
+                flush()
+        cur.append(ch)
+        prev = ch
+    flush()
+    return lines
+
+
+def _runs(line):
+    runs = []
+    style = None
+    for ch in line:
+        if ch.get("gen"):
+            if runs:
+                runs[-1][1].append(" ")
+            continue
+        st = (ch["font"], round(ch["size"] * 2) / 2, ch["color"], ch["weight"] >= 600, ch["italic"])
+        if st != style:
+            runs.append((st, [ch["ch"]]))
+            style = st
+        else:
+            runs[-1][1].append(ch["ch"])
+    res = [(st, "".join(t)) for st, t in runs]
+    if res:
+        res[-1] = (res[-1][0], res[-1][1].rstrip())
+    return [r for r in res if r[1]]
+
+
+def pdf_to_pptx(src, dst, mode="text", progress=None):
+    """mode='text' — фон картинкой + редактируемый текст; mode='image' — страницы картинками."""
+    import io
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as c
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import MSO_AUTO_SIZE
+    from pptx.util import Emu, Pt
+
+    pdf = pdfium.PdfDocument(str(src))
+    n = len(pdf)
+    w0, h0 = pdf[0].get_size()
+    EMU = 12700  # в 1 пункте
+    k = min(1.0, 51206400 / (w0 * EMU), 51206400 / (h0 * EMU))  # PowerPoint: слайд не больше 56″
+    k = max(k, 914400 / (min(w0, h0) * EMU)) if min(w0, h0) * EMU * k < 914400 else k
+    SW, SH = int(w0 * EMU * k), int(h0 * EMU * k)
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Emu(SW), Emu(SH)
+    blank = prs.slide_layouts[6]
+    stats = {"slides": n, "text_slides": 0, "image_slides": 0}
+
+    for i in range(n):
+        page = pdf[i]
+        w, h = page.get_size()
+        kk = min(SW / (w * EMU), SH / (h * EMU))  # пункты страницы → EMU слайда
+        ox = (SW - w * EMU * kk) / 2
+        oy = (SH - h * EMU * kk) / 2
+        scale = min(220 / 72, 3000 / max(w, h))
+        lines = []
+        if mode == "text":
+            chars = _page_chars(page, c)
+            before = page.render(scale=0.25).to_pil()
+            hidden = _hide_text(page, c)
+            lines = _lines_from_chars(chars, hidden)
+            if hidden and lines:
+                after = page.render(scale=0.25).to_pil()
+                if before.tobytes() == after.tobytes():
+                    lines = []  # текст не удалось убрать с фона — оставим страницу картинкой
+        img = page.render(scale=scale, may_draw_forms=True).to_pil().convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=90)
+        buf.seek(0)
+        slide = prs.slides.add_slide(blank)
+        slide.shapes.add_picture(buf, Emu(int(ox)), Emu(int(oy)), Emu(int(w * EMU * kk)), Emu(int(h * EMU * kk)))
+
+        for line in lines:
+            real = [ch for ch in line if not ch.get("gen")]
+            left = min(ch["l"] for ch in real)
+            right = max(ch["r"] for ch in real)
+            top = max(ch["t"] for ch in real)
+            bottom = min(ch["b"] for ch in real)
+            size = max(ch["size"] for ch in real)
+            x = ox + left * EMU * kk
+            y = oy + (h - top) * EMU * kk
+            bw = (right - left + size * 0.6) * EMU * kk * 1.06
+            bh = (top - bottom) * EMU * kk
+            tb = slide.shapes.add_textbox(Emu(int(x)), Emu(int(y)), Emu(int(bw)), Emu(int(max(bh, 1))))
+            tf = tb.text_frame
+            tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+            tf.word_wrap = False
+            tf.auto_size = MSO_AUTO_SIZE.NONE
+            p = tf.paragraphs[0]
+            p.line_spacing = 1.0
+            for (font, sz, col, bold, italic), text in _runs(line):
+                r = p.add_run()
+                r.text = text
+                fam, style = _font_family(font)
+                sl = style.lower()
+                r.font.name = fam
+                r.font.size = Pt(max(1, sz * kk * EMU / 12700))
+                r.font.bold = bold or any(x in sl for x in ("bold", "black", "heavy", "semi"))
+                r.font.italic = italic or "italic" in sl or "oblique" in sl
+                r.font.color.rgb = RGBColor(*[max(0, min(255, int(v))) for v in col])
+        if lines:
+            stats["text_slides"] += 1
+        else:
+            stats["image_slides"] += 1
+        page.close()
+        if progress:
+            progress(i + 1, n)
+    pdf.close()
+    prs.save(str(dst))
+    return stats
+
+
 # ---------- Приложение «Конвертер» для macOS (запуск без Терминала) ----------
 APP_NAME = "Конвертер"
 BUNDLE_VERSION = "2"
@@ -592,7 +834,9 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path.startswith("/out/"):
             f = OUT_DIR / Path(unquote(u.path[5:])).name
             if f.is_file():
-                ctype = "application/pdf" if f.suffix.lower() == ".pdf" else "image/webp"
+                ctype = {".pdf": "application/pdf",
+                         ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                         }.get(f.suffix.lower(), "image/webp")
                 self._send(200, f.read_bytes(), ctype)
             else:
                 self._send(404, b"not found", "text/plain")
@@ -640,6 +884,38 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)})
 
+        if u.path == "/pdf/pptx":
+            name = Path(g("name", "file.pdf")).name
+            mode = "image" if g("mode") == "image" else "text"
+            src = WORK_DIR / (os.urandom(6).hex() + ".src.pdf")
+            with open(src, "wb") as f:
+                left = length
+                while left > 0:
+                    chunk = self.rfile.read(min(1 << 20, left))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    left -= len(chunk)
+            try:
+                wait_pdf_lib()
+                OUT_DIR.mkdir(parents=True, exist_ok=True)
+                dst = unique(OUT_DIR / (Path(name).stem + ".pptx"))
+                try:
+                    st = pdf_to_pptx(src, dst, mode)
+                except Exception as e:
+                    if dst.exists():
+                        dst.unlink()
+                    msg = str(e)
+                    if "password" in msg.lower():
+                        msg = "PDF защищён паролем — снимите пароль и попробуйте снова"
+                    raise RuntimeError(msg)
+                return self._json(dict(ok=True, kind="pptx", name=dst.name, url="/out/" + quote(dst.name),
+                                       **{"in": length, "out": dst.stat().st_size, "mode": mode}, **st))
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)})
+            finally:
+                src.unlink(missing_ok=True)
+
         if u.path in ("/pdf/keep", "/pdf/split"):
             jid = g("id")
             if jid not in JOBS:
@@ -657,6 +933,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
             return
+
+        if u.path == "/openfile":
+            f = OUT_DIR / Path(g("name")).name
+            if f.is_file():
+                opener = "open" if sys.platform == "darwin" else ("explorer" if os.name == "nt" else "xdg-open")
+                subprocess.Popen([opener, str(f)])
+                return self._json({"ok": True})
+            return self._json({"ok": False, "error": "файл не найден"})
 
         if u.path == "/open":
             OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -883,7 +1167,9 @@ const GROUPS={
     w:{label:'Ширина',opts:[['0','Как есть'],['1280','1280'],['720','720'],['480','480']],val:'720'},
     fps:{label:'Плавность',opts:[['10','10 к/с'],['15','15 к/с'],['24','24 к/с'],['30','30 к/с']],val:'15'}}},
   pdf:{title:'PDF',settings:{
-    t:{label:'Уложиться в',opts:[['5','5 МБ'],['10','10 МБ'],['20','20 МБ'],['50','50 МБ']],val:'20',custom:true}}}
+    a:{label:'Что сделать',opts:[['compress','Сжать'],['pptx','Превратить в PowerPoint']],val:'compress'},
+    t:{label:'Уложиться в',opts:[['5','5 МБ'],['10','10 МБ'],['20','20 МБ'],['50','50 МБ']],val:'20',custom:true,when:['a','compress']},
+    m:{label:'Слайды',opts:[['text','С редактируемым текстом'],['image','Точная копия']],val:'text',when:['a','pptx']}}}
 };
 let items=[],seq=0,busy=false,LATEST='',FFMPEG=true;
 
@@ -921,7 +1207,7 @@ function render(){
   updateDock()}
 
 function groupHtml(k){const G=GROUPS[k];
-  const sets=Object.entries(G.settings).map(([key,s])=>`<div class="setting"><label>${s.label}</label><div class="seg" data-k="${key}">${
+  const sets=Object.entries(G.settings).map(([key,s])=>`<div class="setting" data-key="${key}"${s.when?` data-when="${s.when[0]}=${s.when[1]}"`:''}><label>${s.label}</label><div class="seg" data-k="${key}">${
     s.opts.map(([v,t])=>`<button type="button" data-v="${v}" class="${v===s.val?'on':''}">${t}</button>`).join('')}</div>${
     s.custom?`<input class="custom" type="number" min="1" step="1" placeholder="свой" aria-label="Свой размер в МБ">`:''}</div>`).join('');
   return `<div class="ghead"><span class="bar"></span><h2>${G.title}</h2><span class="count"></span></div>
@@ -930,10 +1216,12 @@ function groupHtml(k){const G=GROUPS[k];
 function bindGroup(g,k){
   g.querySelectorAll('.seg').forEach(seg=>seg.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;
     seg.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
-    GROUPS[k].settings[seg.dataset.k].val=b.dataset.v;const c=g.querySelector('.custom');if(c&&seg.dataset.k==='t')c.value='';updateHints(k)}));
+    GROUPS[k].settings[seg.dataset.k].val=b.dataset.v;const c=g.querySelector('.custom');if(c&&seg.dataset.k==='t')c.value='';applyWhen(g,k);updateHints(k)}));
+  applyWhen(g,k);
   const c=g.querySelector('.custom');
   if(c)c.addEventListener('input',()=>{if(c.value){g.querySelectorAll('.seg[data-k=t] button').forEach(x=>x.classList.remove('on'));GROUPS.pdf.settings.t.val=c.value}updateHints(k)})}
 
+function applyWhen(g,k){g.querySelectorAll('[data-when]').forEach(el=>{const [key,v]=el.dataset.when.split('=');el.style.display=GROUPS[k].settings[key].val===v?'':'none'})}
 function fileEl(it){const li=document.createElement('li');li.className='file';
   let th;
   if(it.k==='img'&&!/\.(heic|heif|tiff?)$/i.test(it.f.name)){th=`<img class="thumb" src="${URL.createObjectURL(it.f)}" alt="">`}
@@ -954,9 +1242,11 @@ function updateHints(k){const g=$('g-'+k);if(!g)return;const h=g.querySelector('
     if(!FFMPEG){h.className='hint warn';h.textContent='Для видео нужен ffmpeg, а он не установлен.'}
     else if(long.length){h.className='hint warn';h.textContent=`${long.length>1?'Есть ролики':'Ролик'} длиннее 15 секунд — анимированный WebP получится тяжёлым. Уменьшите ширину или плавность.`}
     else h.textContent='Звук не сохраняется: WebP — это анимация без звука.'}
-  if(k==='pdf'){const t=parseFloat(GROUPS.pdf.settings.t.val)||20;
-    for(const it of items.filter(i=>i.k==='pdf'&&i.st==='new'))it.el.querySelector('.extra').textContent=it.f.size<=t*1048576?'уже меньше лимита, только оптимизируем':'';
-    h.textContent='Если для этого придётся сильно ухудшить картинки, Конвертер спросит, оставить один файл или разделить на несколько.'}}
+  if(k==='pdf'){const S=GROUPS.pdf.settings,t=parseFloat(S.t.val)||20,toPptx=S.a.val==='pptx';
+    for(const it of items.filter(i=>i.k==='pdf'&&i.st==='new'))it.el.querySelector('.extra').textContent=!toPptx&&it.f.size<=t*1048576?'уже меньше лимита, только оптимизируем':'';
+    h.textContent=!toPptx?'Если для этого придётся сильно ухудшить картинки, Конвертер спросит, оставить один файл или разделить на несколько.'
+      :(S.m.val==='text'?'Каждая страница станет слайдом: фон — картинкой, текст — обычными текстовыми блоками, которые можно править. Если в PDF текст нарисован кривыми, такие слайды будут картинками.'
+      :'Каждая страница станет слайдом-картинкой: выглядит точно как PDF, но текст не редактируется.')}}
 
 function updateDock(){const pend=items.filter(i=>i.st==='new');const dock=$('dock');
   dock.style.display=items.length?'block':'none';
@@ -972,15 +1262,17 @@ async function go(){if(busy)return;busy=true;
   queue.forEach(i=>{i.st='wait';i.el.querySelector('.st').textContent='в очереди';setSide(i,'')});
   updateDock();
   for(const it of queue){it.st='work';const st=it.el.querySelector('.st');
-    st.textContent=it.k==='pdf'?'сжимаю, большие файлы — до пары минут':'конвертирую';setSide(it,'<div class="spin"></div>');
+    st.textContent=it.k==='pdf'?(GROUPS.pdf.settings.a.val==='pptx'?'делаю презентацию':'сжимаю, большие файлы — до пары минут'):'конвертирую';setSide(it,'<div class="spin"></div>');
     try{let r;
-      if(it.k==='pdf'){r=await fetch('/pdf/compress?'+new URLSearchParams({name:it.f.name,target:GROUPS.pdf.settings.t.val}),{method:'POST',body:it.f})}
+      if(it.k==='pdf'&&GROUPS.pdf.settings.a.val==='pptx'){r=await fetch('/pdf/pptx?'+new URLSearchParams({name:it.f.name,mode:GROUPS.pdf.settings.m.val}),{method:'POST',body:it.f})}
+      else if(it.k==='pdf'){r=await fetch('/pdf/compress?'+new URLSearchParams({name:it.f.name,target:GROUPS.pdf.settings.t.val}),{method:'POST',body:it.f})}
       else{const S=GROUPS[it.k].settings;const q=S.q.val;
         const p={name:it.f.name,q:q==='lossless'?'90':q,lossless:q==='lossless'?'1':'0',w:S.w.val,fps:it.k==='vid'?S.fps.val:'15'};
         r=await fetch('/convert?'+new URLSearchParams(p),{method:'POST',body:it.f})}
       const j=await r.json();
       if(!j.ok){it.st='err';st.innerHTML=`<span class="bad">${esc(j.error||'ошибка')}</span>`;setSide(it,'')}
       else if(j.kind==='pdf')pdfDone(it,j);
+      else if(j.kind==='pptx')pptxDone(it,j);
       else{it.st='done';const pct=Math.round((1-j.out/j.in)*100);
         st.innerHTML=`→ ${size(j.out)} <span class="${pct>=0?'good':'bad'}">${pct>=0?'−'+pct:'+'+(-pct)}%</span>`;
         setSide(it,`<a class="open" href="/out/${encodeURIComponent(j.name)}" target="_blank">Открыть</a>${CHECK}`)}}
@@ -988,6 +1280,15 @@ async function go(){if(busy)return;busy=true;
   }
   busy=false;updateDock()}
 
+function pptxDone(it,j){it.st='done';const st=it.el.querySelector('.st');
+  let note=`→ PowerPoint, ${j.slides} ${plural(j.slides,'слайд','слайда','слайдов')}, ${size(j.out)}`;
+  if(j.mode==='text'){
+    if(j.text_slides===j.slides)note+=', весь текст редактируется';
+    else if(j.text_slides===0)note+=`. <span class="warn">Текст в этом PDF нарисован кривыми, поэтому слайды вставлены картинками</span>`;
+    else note+=`. <span class="warn">Текст редактируется на ${j.text_slides} из ${j.slides}; на остальных он нарисован кривыми — там картинки</span>`}
+  st.innerHTML=note;
+  setSide(it,`<button class="open" data-n="${esc(j.name)}" style="border:0;background:none;cursor:pointer">Открыть</button>${CHECK}`);
+  it.el.querySelector('.side .open').onclick=e=>fetch('/openfile?'+new URLSearchParams({name:e.target.dataset.n}),{method:'POST'})}
 function showParts(it,saved){it.el.querySelector('.parts')?.remove();
   const d=document.createElement('div');d.className='parts';
   d.innerHTML=saved.map(x=>`<div class="part"><div>${esc(x.name)} <span>${size(x.size)}${x.pages?', стр. '+x.pages:''}${x.fits===false?', больше лимита':''}</span></div><a class="open" href="/out/${encodeURIComponent(x.name)}" target="_blank">Открыть</a></div>`).join('');
