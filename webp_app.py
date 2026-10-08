@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.2"
+VERSION = "1.3"
 REPO_RAW = os.environ.get("WEBP_REPO", "https://raw.githubusercontent.com/mkkatrin/webp-converter/main/")
 APP_FILE = Path(__file__).resolve()
 
@@ -92,14 +92,16 @@ def unique(path: Path) -> Path:
 
 
 # ---------- Сжатие PDF ----------
-# Уровни: (макс. dpi картинок, качество JPEG, подпись). 0 — без потерь.
+# Уровни: (макс. dpi, макс. пикселей по длинной стороне страницы, качество JPEG, подпись).
+# Пиксельный предел нужен для больших страниц (слайды, плакаты), где dpi сам по себе
+# даёт огромные картинки. 0 — без потерь.
 PDF_LEVELS = [
-    (None, None, "без потерь"),
-    (200, 85, "почти без потерь"),
-    (150, 75, "хорошее качество"),
-    (110, 65, "заметное сжатие"),
-    (85, 55, "сильное сжатие"),
-    (72, 40, "очень сильное сжатие"),
+    (None, None, None, "без потерь"),
+    (200, 5000, 85, "почти без потерь"),
+    (150, 3600, 78, "хорошее качество"),
+    (110, 2600, 68, "заметное сжатие"),
+    (85, 1920, 58, "сильное сжатие"),
+    (72, 1400, 45, "очень сильное сжатие"),
 ]
 PDF_STRONG = 4          # с этого уровня считаем потерю качества сильной
 PDF_GOOD = 2            # уровень, который стараемся сохранить при разделении
@@ -137,83 +139,129 @@ def wait_pdf_lib(timeout=600):
                            + PDF_STATE.get("error", ""))
 
 
+def _walk_images(res, out, seen_forms, depth=0):
+    """Все картинки в ресурсах, включая вложенные блоки (Form XObject) и маски прозрачности."""
+    import pikepdf
+    if depth > 12 or not isinstance(res, pikepdf.Dictionary):
+        return
+    xobjs = res.get("/XObject")
+    if not isinstance(xobjs, pikepdf.Dictionary):
+        return
+    for _, xo in xobjs.items():
+        if not isinstance(xo, pikepdf.Stream):
+            continue
+        st = xo.get("/Subtype")
+        if st == "/Image":
+            out.append(xo)
+            sm = xo.get("/SMask")
+            if isinstance(sm, pikepdf.Stream):
+                out.append(sm)
+        elif st == "/Form" and xo.objgen not in seen_forms:
+            seen_forms.add(xo.objgen)
+            _walk_images(xo.get("/Resources"), out, seen_forms, depth + 1)
+
+
+def _page_images(page):
+    out = []
+    try:
+        _walk_images(page.obj.get("/Resources"), out, set())
+    except Exception:
+        pass
+    return out
+
+
 def _image_weights(pdf):
     """Для каждой картинки — самая большая страница, на которой она стоит (в дюймах),
     и «вес» каждой страницы (сколько байт картинок на ней) для деления на части."""
-    import pikepdf
     pages_in = {}
     weights = []
     for page in pdf.pages:
-        box = page.mediabox
-        w_in = abs(float(box[2]) - float(box[0])) / 72
-        h_in = abs(float(box[3]) - float(box[1])) / 72
-        side = max(w_in, h_in) or 11.7
-        wsum = 0
         try:
-            imgs = page.images
+            box = page.mediabox
+            side = max(abs(float(box[2]) - float(box[0])), abs(float(box[3]) - float(box[1]))) / 72
         except Exception:
-            imgs = {}
-        for _, raw in imgs.items():
-            if not isinstance(raw, pikepdf.Stream):
-                continue
+            side = 11.7
+        side = side or 11.7
+        wsum, counted = 0, set()
+        for raw in _page_images(page):
             key = raw.objgen
             pages_in[key] = max(pages_in.get(key, 0), side)
-            try:
-                wsum += int(raw.get("/Length", 0))
-            except Exception:
-                pass
+            if key not in counted:
+                counted.add(key)
+                try:
+                    wsum += int(raw.get("/Length", 0))
+                except Exception:
+                    pass
         weights.append(wsum + 5000)
     return pages_in, weights
 
 
-def _recompress_images(pdf, max_dpi, quality):
+def _recompress_images(pdf, max_dpi, cap_px, quality, mask_jpeg):
     import io
+    import zlib
     import pikepdf
     from pikepdf import Name, PdfImage
     from PIL import Image
     pages_in, _ = _image_weights(pdf)
-    done = set()
+    default_side = max(pages_in.values()) if pages_in else 11.7
+    # какие картинки — маски прозрачности (их сжимаем без JPEG-артефактов на краях)
+    # берём только картинки, которые реально стоят на страницах (с вложенными блоками)
+    targets, masks = {}, set()
     for page in pdf.pages:
+        for img in _page_images(page):
+            targets.setdefault(img.objgen, img)
+            sm = img.get("/SMask")
+            if isinstance(sm, pikepdf.Stream):
+                masks.add(sm.objgen)
+    for raw in targets.values():
         try:
-            imgs = page.images
-        except Exception:
-            continue
-        for _, raw in imgs.items():
-            if not isinstance(raw, pikepdf.Stream) or raw.objgen in done:
+            if raw.get("/ImageMask", False) or int(raw.get("/BitsPerComponent", 8)) < 8:
+                continue  # чёрно-белые маски и сканы 1-бит не трогаем
+            old_len = int(raw.get("/Length", 0))
+            if old_len < 15000:
                 continue
-            done.add(raw.objgen)
-            try:
-                if raw.get("/ImageMask", False) or int(raw.get("/BitsPerComponent", 8)) < 8:
-                    continue  # чёрно-белые маски и сканы 1-бит не трогаем
-                old_len = int(raw.get("/Length", 0))
-                if old_len < 15000:
-                    continue
-                pil = PdfImage(raw).as_pil_image()
-                if pil.mode in ("L", "LA", "I", "I;16", "1"):
-                    pil, cs = pil.convert("L"), Name.DeviceGray
-                else:
-                    pil, cs = pil.convert("RGB"), Name.DeviceRGB
-                side_in = pages_in.get(raw.objgen, 11.7)
-                max_px = int(max_dpi * side_in)
-                if max(pil.size) > max_px:
-                    k = max_px / max(pil.size)
-                    pil = pil.resize((max(1, round(pil.width * k)), max(1, round(pil.height * k))), Image.LANCZOS)
+            is_mask = raw.objgen in masks
+            side_in = pages_in.get(raw.objgen, default_side)
+            max_px = min(int(max_dpi * side_in), cap_px)
+            pil = PdfImage(raw).as_pil_image()
+            if is_mask:
+                pil = pil.convert("L")
+            elif pil.mode in ("L", "LA", "I", "I;16", "1"):
+                pil = pil.convert("L")
+            else:
+                pil = pil.convert("RGB")
+            if max(pil.size) > max_px:
+                k = max_px / max(pil.size)
+                pil = pil.resize((max(1, round(pil.width * k)), max(1, round(pil.height * k))), Image.LANCZOS)
+            if is_mask and not mask_jpeg:
+                data, flt = zlib.compress(pil.tobytes(), 9), Name.FlateDecode
+            elif is_mask:
+                buf = io.BytesIO()
+                pil.save(buf, "JPEG", quality=min(95, quality + 12))
+                data, flt = buf.getvalue(), Name.DCTDecode
+            else:
                 buf = io.BytesIO()
                 pil.save(buf, "JPEG", quality=quality, optimize=True, progressive=True)
-                data = buf.getvalue()
-                if len(data) >= old_len * 0.95:
-                    continue  # не стало меньше — оставляем как было
-                raw.write(data, filter=Name.DCTDecode)
-                raw.Width, raw.Height = pil.width, pil.height
-                raw.ColorSpace = cs
-                raw.BitsPerComponent = 8
-                for k in ("/DecodeParms", "/Decode"):
-                    if k in raw:
-                        del raw[k]
-                if "/Mask" in raw and isinstance(raw.Mask, pikepdf.Array):
-                    del raw["/Mask"]
-            except Exception:
-                continue  # необычную картинку оставляем как есть
+                data, flt = buf.getvalue(), Name.DCTDecode
+            if len(data) >= old_len * 0.95:
+                continue  # не стало меньше — оставляем как было
+            # цветовой профиль сохраняем, если он подходит по числу каналов
+            cs = raw.get("/ColorSpace")
+            n_out = 1 if pil.mode == "L" else 3
+            keep_cs = (isinstance(cs, pikepdf.Array) and len(cs) == 2 and cs[0] == "/ICCBased"
+                       and int(cs[1].get("/N", 0)) == n_out)
+            raw.write(data, filter=flt)
+            raw.Width, raw.Height = pil.width, pil.height
+            if not keep_cs:
+                raw.ColorSpace = Name.DeviceGray if n_out == 1 else Name.DeviceRGB
+            raw.BitsPerComponent = 8
+            for k in ("/DecodeParms", "/Decode"):
+                if k in raw:
+                    del raw[k]
+            if "/Mask" in raw and isinstance(raw.Mask, pikepdf.Array):
+                del raw["/Mask"]
+        except Exception:
+            continue  # необычную картинку оставляем как есть
 
 
 def pdf_at_level(src, dst, level, pages=None):
@@ -225,9 +273,9 @@ def pdf_at_level(src, dst, level, pages=None):
             for i in range(len(pdf.pages) - 1, -1, -1):
                 if i not in keep:
                     del pdf.pages[i]
-        dpi, q, _ = PDF_LEVELS[level]
+        dpi, cap, q, _ = PDF_LEVELS[level]
         if dpi:
-            _recompress_images(pdf, dpi, q)
+            _recompress_images(pdf, dpi, cap, q, mask_jpeg=level >= 2)
         try:
             pdf.remove_unreferenced_resources()
         except Exception:
@@ -239,17 +287,36 @@ def pdf_at_level(src, dst, level, pages=None):
 
 def pdf_fit(src, dst, target, pages=None, start=0):
     """Подбирает самый мягкий уровень, при котором файл влезает в target.
+    Сначала без потерь; если не влезло — пробует средний уровень и идёт
+    к более мягким (пока влезает) или к более сильным (пока не влезет).
     Возвращает (уровень, размер, {уровень: размер})."""
-    sizes = {}
-    for lvl in range(start, len(PDF_LEVELS)):
+    sizes, files = {}, {}
+    last = len(PDF_LEVELS) - 1
+
+    def attempt(lvl):
         tmp = Path(str(dst) + f".l{lvl}")
         sizes[lvl] = pdf_at_level(src, tmp, lvl, pages)
-        if sizes[lvl] <= target or lvl == len(PDF_LEVELS) - 1:
-            os.replace(tmp, dst)
-            for other in Path(dst).parent.glob(Path(dst).name + ".l*"):
-                other.unlink()
-            return lvl, sizes[lvl], sizes
-    raise RuntimeError("не удалось сжать")
+        files[lvl] = tmp
+        return sizes[lvl] <= target
+
+    if not attempt(0):
+        mid = 3
+        if attempt(mid):
+            lvl = mid
+            while lvl > 1 and attempt(lvl - 1):
+                lvl -= 1
+        else:
+            lvl = mid
+            while lvl < last and not attempt(lvl + 1):
+                lvl += 1
+            lvl = min(lvl + 1, last)
+    else:
+        lvl = 0
+    os.replace(files[lvl], dst)
+    for k, f in files.items():
+        if k != lvl and f.exists():
+            f.unlink()
+    return lvl, sizes[lvl], sizes
 
 
 def split_pages(weights, parts):
@@ -291,12 +358,12 @@ def pdf_compress_job(src, name, target_mb):
     parts = 0
     if strong and n_pages > 1:
         # сколько частей нужно, чтобы остаться на «хорошем качестве»
-        good_size = sizes.get(PDF_GOOD) or size
+        good_size = sizes.get(PDF_GOOD) or int(sizes.get(3, size) * 1.35)
         parts = max(2, -(-int(good_size * 1.08) // target))
         parts = min(parts, n_pages, 10)
     out = {"ok": True, "kind": "pdf", "id": jid, "in": in_size, "out": size, "pages": n_pages,
-           "level": PDF_LEVELS[lvl][2], "level_n": lvl, "fits": fits, "target_mb": target_mb,
-           "choice": strong, "parts": parts, "dpi": PDF_LEVELS[lvl][0]}
+           "level": PDF_LEVELS[lvl][3], "level_n": lvl, "fits": fits, "target_mb": target_mb,
+           "choice": strong, "parts": parts}
     if not strong:
         out.update(pdf_keep(jid))
     return out
@@ -312,7 +379,7 @@ def pdf_keep(jid):
     dst = _out_name(Path(job["name"]).stem, " (сжатый).pdf")
     shutil.copy2(job["res"], dst)
     return {"saved": [{"name": dst.name, "url": "/out/" + quote(dst.name), "size": dst.stat().st_size,
-                       "level": PDF_LEVELS[job["level"]][2]}]}
+                       "level": PDF_LEVELS[job["level"]][3]}]}
 
 
 def pdf_split(jid, parts):
@@ -327,7 +394,7 @@ def pdf_split(jid, parts):
         dst = _out_name(stem, f" — часть {i} из {len(groups)}.pdf")
         shutil.move(str(tmp), dst)
         saved.append({"name": dst.name, "url": "/out/" + quote(dst.name), "size": size,
-                      "level": PDF_LEVELS[lvl][2], "pages": f"{pages[0] + 1}–{pages[-1] + 1}",
+                      "level": PDF_LEVELS[lvl][3], "pages": f"{pages[0] + 1}–{pages[-1] + 1}",
                       "fits": size <= job["target"]})
     return {"saved": saved}
 
