@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-WebP Конвертер — приложение с окном в браузере.
+Конвертер — перевод картинок и видео в WebP, с окном в браузере.
 
-Запуск:  python3 webp_app.py
+Запуск:  python3 webp_app.py            (или значок «Конвертер» на macOS)
+         python3 webp_app.py --install  (создать приложение «Конвертер»)
 Откроется страница в браузере: перетащите туда картинки или видео.
 Готовые файлы сохраняются в папку «Загрузки/WebP».
 
@@ -16,12 +17,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.0"
+VERSION = "1.1"
 REPO_RAW = os.environ.get("WEBP_REPO", "https://raw.githubusercontent.com/mkkatrin/webp-converter/main/")
 APP_FILE = Path(__file__).resolve()
 
@@ -89,6 +91,113 @@ def unique(path: Path) -> Path:
         i += 1
 
 
+# ---------- Приложение «Конвертер» для macOS (запуск без Терминала) ----------
+APP_NAME = "Конвертер"
+BUNDLE_VERSION = "2"
+BUNDLE = Path.home() / "Applications" / f"{APP_NAME}.app"
+DESKTOP = Path.home() / "Desktop"
+
+RUN_SCRIPT = """#!/bin/zsh
+# Если конвертер уже запущен — просто открываем страницу
+if curl -fs --max-time 1 http://127.0.0.1:8765/status >/dev/null 2>&1; then
+  open "http://127.0.0.1:8765/"; exit 0
+fi
+cd "$HOME/webp-tool" || exit 1
+exec .venv/bin/python webp_app.py --app >> "$HOME/webp-tool/log.txt" 2>&1
+"""
+
+INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleName</key><string>{name}</string>
+  <key>CFBundleDisplayName</key><string>{name}</string>
+  <key>CFBundleIdentifier</key><string>com.mkkatrin.converter</string>
+  <key>CFBundleExecutable</key><string>run</string>
+  <key>CFBundleIconFile</key><string>icon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>{ver}</string>
+  <key>CFBundleVersion</key><string>{bver}</string>
+  <key>LSUIElement</key><true/>
+</dict></plist>
+"""
+
+
+def make_icon(path: Path):
+    """Рисует иконку приложения и сохраняет в .icns."""
+    from PIL import Image, ImageDraw
+    S = 1024
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    grad = Image.new("RGBA", (S, S))
+    gd = ImageDraw.Draw(grad)
+    for y in range(S):  # градиент сверху вниз: голубой → синий
+        t = y / S
+        gd.line([(0, y), (S, y)], fill=(int(64 + (10 - 64) * t), int(170 + (90 - 170) * t), 255, 255))
+    mask = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([100, 100, S - 100, S - 100], radius=185, fill=255)
+    img.paste(grad, (0, 0), mask)
+    d = ImageDraw.Draw(img)
+    # «фотография»: рамка, солнце и горы
+    d.rounded_rectangle([250, 290, 774, 734], radius=60, outline=(255, 255, 255, 255), width=44)
+    d.ellipse([350, 370, 450, 470], fill=(255, 255, 255, 255))
+    d.polygon([(300, 690), (470, 500), (580, 610), (640, 550), (730, 690)], fill=(255, 255, 255, 255))
+    img.save(path, sizes=[(16, 16), (32, 32), (64, 64), (128, 128), (256, 256), (512, 512), (1024, 1024)])
+
+
+def install_bundle(force=False):
+    """Создаёт ~/Applications/Конвертер.app и значок на Рабочем столе.
+    Возвращает True, если приложение было создано или обновлено сейчас."""
+    if sys.platform != "darwin":
+        return False
+    plist = BUNDLE / "Contents" / "Info.plist"
+    if not force and plist.exists() and f"<string>{BUNDLE_VERSION}</string>" in plist.read_text("utf-8"):
+        return False
+    macos = BUNDLE / "Contents" / "MacOS"
+    res = BUNDLE / "Contents" / "Resources"
+    macos.mkdir(parents=True, exist_ok=True)
+    res.mkdir(parents=True, exist_ok=True)
+    run = macos / "run"
+    run.write_text(RUN_SCRIPT, "utf-8")
+    run.chmod(0o755)
+    plist.write_text(INFO_PLIST.format(name=APP_NAME, ver=VERSION, bver=BUNDLE_VERSION), "utf-8")
+    try:
+        make_icon(res / "icon.icns")
+    except Exception as e:
+        print("Иконка не создана:", e)
+    lsreg = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+             "LaunchServices.framework/Support/lsregister")
+    for cmd in (["xattr", "-cr", str(BUNDLE)], ["touch", str(BUNDLE)], [lsreg, "-f", str(BUNDLE)]):
+        try:
+            subprocess.run(cmd, capture_output=True)
+        except OSError:
+            pass
+    # Значок на Рабочем столе вместо старого WebP.command
+    try:
+        old = DESKTOP / "WebP.command"
+        if old.is_file() and "webp-tool" in old.read_text("utf-8", "ignore"):
+            old.unlink()
+        link = DESKTOP / APP_NAME
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to(BUNDLE)
+    except Exception as e:
+        print("Значок на Рабочем столе не создан:", e)
+    return True
+
+
+# ---------- Автовыключение, когда вкладка закрыта ----------
+LAST_SEEN = [0.0]
+MIGRATED = [False]
+IDLE_LIMIT = 180  # секунд без связи со страницей
+
+
+def watchdog(srv):
+    import time
+    while True:
+        time.sleep(10)
+        if LAST_SEEN[0] and time.time() - LAST_SEEN[0] > IDLE_LIMIT:
+            srv.shutdown()
+            return
+
+
 def vtuple(v):
     try:
         return tuple(int(x) for x in str(v).split("."))
@@ -153,11 +262,15 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
 
     def do_GET(self):
+        LAST_SEEN[0] = time.time()
         u = urlparse(self.path)
-        if u.path == "/":
+        if u.path == "/ping":
+            self._json({"ok": True})
+        elif u.path == "/":
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
         elif u.path == "/status":
-            self._json({"ffmpeg": bool(find_ffmpeg()), "out": str(OUT_DIR), "version": VERSION})
+            self._json({"ffmpeg": bool(find_ffmpeg()), "out": str(OUT_DIR), "version": VERSION,
+                        "migrated": MIGRATED[0], "app": sys.platform == "darwin"})
         elif u.path == "/update/check":
             self._json(check_update())
         elif u.path.startswith("/out/"):
@@ -170,6 +283,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
+        LAST_SEEN[0] = time.time()
         u = urlparse(self.path)
         q = parse_qs(u.query)
 
@@ -186,6 +300,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
             port = self.server.server_address[1]
             threading.Timer(0.5, restart, args=(port,)).start()
+            return
+
+        if u.path == "/quit":
+            self._json({"ok": True})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
             return
 
         if u.path == "/open":
@@ -237,7 +356,7 @@ class Handler(BaseHTTPRequestHandler):
 PAGE = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WebP Конвертер</title>
+<title>Конвертер</title>
 <style>
 :root{--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--muted:#6e6e73;--line:#e3e3e8;--accent:#0a7cff;--ok:#1f9d55;--err:#d93025;--drop:#eef5ff}
 @media (prefers-color-scheme:dark){:root{--bg:#161618;--card:#222225;--text:#f2f2f4;--muted:#9a9aa0;--line:#333338;--accent:#4c9dff;--ok:#3ccf7a;--err:#ff6b5e;--drop:#1c2633}}
@@ -280,9 +399,16 @@ input[type=number],select{width:100%;padding:7px 10px;border:1px solid var(--lin
 .upd .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .upd .msg{font-size:14px;color:var(--muted)}
 .ver{color:var(--muted);font-size:12px;margin-top:14px;text-align:center}
+.ver a{color:var(--muted);margin-left:10px}
+.note{display:none;margin:0 0 18px;padding:14px 16px;border-radius:14px;background:rgba(31,157,85,.1);border:1px solid var(--ok);font-size:14px}
+.note b{display:block;font-size:15px;margin-bottom:4px}
+.bye{display:none;text-align:center;padding:80px 16px;color:var(--muted)}
+.bye b{display:block;color:var(--text);font-size:20px;margin-bottom:6px}
 </style></head><body><div class="wrap">
-<h1>WebP Конвертер</h1>
+<h1>Конвертер</h1>
 <p class="sub">Картинки и видео → WebP. Всё обрабатывается на этом компьютере.</p>
+
+<div class="note" id="note"><b>Теперь без Терминала</b>Конвертер запускается значком «Конвертер» на Рабочем столе или в Launchpad. Окно Терминала можно закрыть — при следующем запуске оно больше не появится.</div>
 
 <div class="upd" id="upd">
   <b id="updTitle">Доступно обновление</b>
@@ -312,7 +438,9 @@ input[type=number],select{width:100%;padding:7px 10px;border:1px solid var(--lin
   <span class="path" id="path"></span>
   <span><button class="btn ghost" id="clear">Очистить список</button> <button class="btn" id="open">Открыть папку WebP</button></span>
 </div>
-<div class="ver" id="ver"></div>
+<div class="ver"><span id="ver"></span><a href="#" id="quit">Закрыть конвертер</a></div>
+</div>
+<div class="bye" id="bye"><b>Конвертер закрыт</b>Чтобы снова открыть его, запустите значок «Конвертер».
 </div>
 <script>
 const $=id=>document.getElementById(id);
@@ -320,7 +448,9 @@ const drop=$('drop'),pick=$('pick'),list=$('list');
 const queue=[];let busy=false;
 function size(n){if(n<1024)return n+' Б';if(n<1048576)return (n/1024).toFixed(0)+' КБ';return (n/1048576).toFixed(1)+' МБ'}
 function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-fetch('/status').then(r=>r.json()).then(s=>{$('path').textContent='Сохраняется в: '+s.out.replace(/^\/Users\/[^/]+/,'~');if(!s.ffmpeg)$('warn').style.display='block';$('ver').textContent='Версия '+s.version});
+fetch('/status').then(r=>r.json()).then(s=>{$('path').textContent='Сохраняется в: '+s.out.replace(/^\/Users\/[^/]+/,'~');if(!s.ffmpeg)$('warn').style.display='block';$('ver').textContent='Версия '+s.version;if(s.migrated)$('note').style.display='block'});
+setInterval(()=>fetch('/ping').catch(()=>{}),20000);
+$('quit').onclick=e=>{e.preventDefault();fetch('/quit',{method:'POST'}).catch(()=>{});document.querySelector('.wrap').style.display='none';$('bye').style.display='block'};
 let LATEST='';
 fetch('/update/check').then(r=>r.json()).then(u=>{if(!u.available)return;LATEST=u.latest;
 $('updTitle').textContent=`Доступно обновление ${u.latest}`;
@@ -354,12 +484,20 @@ el.querySelector('.thumb').outerHTML=`<img class="thumb" src="${t}" alt="">`;
 meta.innerHTML=`${size(j.in)} → ${size(j.out)} · <span class="${pct>=0?'good':'bad'}">${pct>=0?'−'+pct:'+'+(-pct)}%</span>`;
 const a=document.createElement('a');a.className='dl';a.href=t;a.download=j.name;a.textContent='Скачать';el.appendChild(a)}
 else meta.innerHTML=`<span class="bad">Ошибка: ${esc(j.error||'неизвестно')}</span>`}
-catch(e){sp.remove();meta.innerHTML='<span class="bad">Нет связи с приложением — оно запущено?</span>'}
+catch(e){sp.remove();meta.innerHTML='<span class="bad">Нет связи — конвертер закрыт? Запустите значок «Конвертер»</span>'}
 el.classList.add('done')}busy=false}
 </script></body></html>"""
 
 
 def main():
+    if "--install" in sys.argv:
+        install_bundle(force=True)
+        print(f"Приложение «{APP_NAME}» создано:", BUNDLE)
+        return
+    try:
+        MIGRATED[0] = install_bundle()
+    except Exception as e:
+        print("Не удалось создать приложение:", e)
     srv = None
     pref = int(os.environ.get("WEBP_PORT", "0") or 0)
     ports = ([pref] if pref else []) + [8765, 8766, 8767, 0]
@@ -370,9 +508,10 @@ def main():
         except OSError:
             continue
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
-    print(f"WebP Конвертер {VERSION} запущен:", url)
+    print(f"{APP_NAME} {VERSION} запущен:", url)
     print("Готовые файлы:", OUT_DIR)
-    print("Чтобы закрыть приложение — закройте это окно или нажмите Ctrl+C.")
+    LAST_SEEN[0] = time.time()
+    threading.Thread(target=watchdog, args=(srv,), daemon=True).start()
     if not os.environ.get("WEBP_NO_BROWSER"):
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:

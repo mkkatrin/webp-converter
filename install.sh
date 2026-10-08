@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Установщик WebP Конвертера для macOS.
+# Установщик Конвертера для macOS.
 # Запуск одной командой в Терминале:
 #   curl -fsSL https://raw.githubusercontent.com/mkkatrin/webp-converter/main/install.sh | zsh
 
@@ -11,7 +11,7 @@ finish() { echo; read "?Нажмите Enter, чтобы закрыть…" < /d
 
 clear
 echo "================================="
-echo "   Установка WebP Конвертера"
+echo "   Установка Конвертера   "
 echo "================================="
 echo
 
@@ -40,19 +40,9 @@ echo "→ Устанавливаю библиотеки для картинок 
 .venv/bin/pip install -q --disable-pip-version-check pillow pillow-heif \
   || { echo "Не удалось установить библиотеки. Проверьте интернет."; finish 1; }
 
-# 4. Значок запуска
-cat > "$APP/WebP.command" <<'EOF'
-#!/bin/zsh
-cd "$HOME/webp-tool" || exit 1
-[ -x /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv zsh)"
-[ -x /usr/local/bin/brew ] && eval "$(/usr/local/bin/brew shellenv zsh)"
-clear
-exec .venv/bin/python webp_app.py
-EOF
-chmod +x "$APP/WebP.command"
-cp "$APP/WebP.command" "$HOME/Desktop/WebP.command" 2>/dev/null
-xattr -c "$APP/WebP.command" "$HOME/Desktop/WebP.command" "$APP/webp_app.py" 2>/dev/null
-echo "→ Значок WebP.command создан на Рабочем столе"
+# 4. Приложение «Конвертер» (запуск без Терминала)
+.venv/bin/python webp_app.py --install >/dev/null || { echo "Не удалось создать приложение"; finish 1; }
+echo "→ Приложение «Конвертер» создано: Рабочий стол и Launchpad"
 
 # 5. ffmpeg для видео (необязательно)
 for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x $b ] && eval "$($b shellenv zsh)"; done
@@ -83,10 +73,10 @@ fi
 
 echo
 echo "================================="
-echo "  Готово! Запускайте WebP.command"
-echo "  на Рабочем столе."
+echo "  Готово! Запускайте значок"
+echo "  «Конвертер» на Рабочем столе."
 echo "================================="
 if ask "Открыть конвертер прямо сейчас? (д/н): "; then
-  exec "$APP/WebP.command" < /dev/tty
+  open "$HOME/Applications/Конвертер.app"; exit 0
 fi
 finish
